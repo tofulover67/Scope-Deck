@@ -23,6 +23,16 @@ Download the current release from this repository's Releases page.
 Then, in Resolve, add **Scope Tap** (OpenFX, *Scope Deck* group) to a node on
 the Color page and open Scope Deck.
 
+**One display on a Mac?** Keep part of Resolve's viewer visible beside Scope
+Deck. When Resolve's window is completely covered, macOS puts it to sleep
+(App Nap) and its playback runs fast with no sound. Scope Deck opens at three
+quarters of the screen for this reason and remembers where you put it. To
+turn App Nap off for Resolve altogether, run this once and restart Resolve:
+
+```bash
+defaults write com.blackmagic-design.DaVinciResolve NSAppSleepDisabled -bool YES
+```
+
 ## Build from source
 
 Both builds use the vendored dependencies in `vendor/` (Dear ImGui, GLFW,

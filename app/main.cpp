@@ -1303,6 +1303,20 @@ struct App
     std::vector<int>  closePanelIds;
 
     Preferences      prefs;
+
+#ifdef __APPLE__
+    // The main window's position and size, remembered across launches (see
+    // PlaceMainWindow). Windows launches maximized instead and keeps nothing:
+    // see main() for why the two platforms differ here.
+    struct MainWindowGeometry
+    {
+        int  x = 0, y = 0, width = 0, height = 0;
+        bool maximized = false;
+        bool saved     = false;   // true once a launch has recorded anything
+    };
+    MainWindowGeometry mainWindow;
+#endif
+
     bool             layoutBuilt        = false;
     bool             forceDefaultLayout = false;
 
@@ -1498,6 +1512,14 @@ void CollectSettingFields(App& p_App,
     p_Out.push_back({ "prefs.spaceFocusesResolve", FieldType::Bool, &p_App.prefs.spaceFocusesResolve });
     p_Out.push_back({ "prefs.hostInput",     FieldType::Int,  &p_App.prefs.hostInput });
     p_Out.push_back({ "prefs.soloFullScreen", FieldType::Bool, &p_App.prefs.soloFullScreen });
+#ifdef __APPLE__
+    p_Out.push_back({ "window.saved",     FieldType::Bool, &p_App.mainWindow.saved });
+    p_Out.push_back({ "window.x",         FieldType::Int,  &p_App.mainWindow.x });
+    p_Out.push_back({ "window.y",         FieldType::Int,  &p_App.mainWindow.y });
+    p_Out.push_back({ "window.width",     FieldType::Int,  &p_App.mainWindow.width });
+    p_Out.push_back({ "window.height",    FieldType::Int,  &p_App.mainWindow.height });
+    p_Out.push_back({ "window.maximized", FieldType::Bool, &p_App.mainWindow.maximized });
+#endif
     p_Out.push_back({ "prefs.prPreviewScale", FieldType::Int,  &p_App.prefs.premierePreviewScale });
     p_Out.push_back({ "prefs.prRowStep",      FieldType::Int,  &p_App.prefs.premiereRowStep });
     p_Out.push_back({ "prefs.showSubtitles", FieldType::Bool, &p_App.prefs.showSubtitles });
@@ -9403,7 +9425,77 @@ struct RenderContext
     App*  app            = nullptr;
     float forcedDpiScale = 0.0f;
     float appliedDpiScale = 1.0f;
+#ifdef __APPLE__
+    bool  mainWindowPlaced = false;   // see PlaceMainWindow
+#endif
 };
+
+#ifdef __APPLE__
+// The main window on macOS: put where it was last time, once layout.ini has
+// been read, and its position recorded every frame after that so the next
+// launch can do the same.
+//
+// Why macOS remembers the window and Windows launches maximized: on a
+// one-display Mac a maximized Scope Deck covers DaVinci Resolve completely,
+// and macOS then treats the fully hidden Resolve as idle (App Nap) - its
+// playback free-runs with no sound until any part of its window shows
+// again. Measured on a MacBook with Resolve 21: the moment Resolve's
+// viewer is partly visible, playback is normal. So the Mac build opens at
+// three quarters of the display, where Resolve's viewer can stay in view
+// beside it, and then keeps whatever arrangement the user settles on.
+//
+// Runs after ImGui::NewFrame, because the first NewFrame is what reads the
+// .ini - the window is created hidden in main() and shown here, so it never
+// appears at the default size and then jumps.
+bool MainWindowRectOnScreen(const App::MainWindowGeometry& p_G)
+{
+    const int cx = p_G.x + p_G.width / 2, cy = p_G.y + p_G.height / 2;
+    int count = 0;
+    GLFWmonitor** monitors = glfwGetMonitors(&count);
+    for (int i = 0; i < count; ++i)
+    {
+        int mx = 0, my = 0, mw = 0, mh = 0;
+        glfwGetMonitorWorkarea(monitors[i], &mx, &my, &mw, &mh);
+        if (cx >= mx && cx < mx + mw && cy >= my && cy < my + mh) return true;
+    }
+    return false;
+}
+
+void PlaceMainWindow(App& p_App, GLFWwindow* p_Window, RenderContext& p_Ctx)
+{
+    App::MainWindowGeometry& g = p_App.mainWindow;
+
+    if (!p_Ctx.mainWindowPlaced)
+    {
+        p_Ctx.mainWindowPlaced = true;
+        // A saved rectangle whose centre is on no current display (an
+        // external monitor since unplugged) is ignored; the default placement
+        // from main() stands.
+        if (g.saved && g.width >= 320 && g.height >= 240 && MainWindowRectOnScreen(g))
+        {
+            glfwSetWindowPos(p_Window, g.x, g.y);
+            glfwSetWindowSize(p_Window, g.width, g.height);
+            if (g.maximized) glfwMaximizeWindow(p_Window);
+        }
+        glfwShowWindow(p_Window);
+        return;
+    }
+
+    // Not while Solo Fills the Screen has the window borderless, or while
+    // it is minimised: neither is a size worth coming back to.
+    if (p_App.fullScreen.window == p_Window || p_App.fullScreen.phase != App::FullScreenSolo::Phase::Idle) return;
+    if (glfwGetWindowAttrib(p_Window, GLFW_ICONIFIED) == GLFW_TRUE) return;
+
+    const bool maximized = glfwGetWindowAttrib(p_Window, GLFW_MAXIMIZED) == GLFW_TRUE;
+    g.maximized = maximized;
+    if (!maximized)
+    {
+        glfwGetWindowPos(p_Window, &g.x, &g.y);
+        glfwGetWindowSize(p_Window, &g.width, &g.height);
+    }
+    g.saved = true;   // MarkSettingsDirtyIfChanged notices any change and schedules the save
+}
+#endif
 
 // The whole body of a frame, pulled out of main()'s loop so it can also run
 // from glfwSetWindowRefreshCallback. On Windows, dragging a window's edge
@@ -9593,6 +9685,10 @@ void RenderOneFrame(GLFWwindow* p_Window, RenderContext& p_Ctx)
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
+#ifdef __APPLE__
+    PlaceMainWindow(app, p_Window, p_Ctx);
+#endif
+
     // Esc leaves a full-screen Solo: with no menu bar or tab there is nothing
     // else on screen to click, and the right-click menu is easy to miss.
     // Checked after NewFrame for the same reason as Space below.
@@ -9744,19 +9840,38 @@ int main(int argc, char** argv)
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
 #endif
 
+    int initialWidth = 1600, initialHeight = 900;
+#ifdef __APPLE__
+    // Not maximized on macOS, and hidden until PlaceMainWindow has read the
+    // remembered position - see that function for the Resolve/App Nap
+    // reason. First launch: three quarters of the main display, centred.
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    int workX = 0, workY = 0, workW = 0, workH = 0;
+    glfwGetMonitorWorkarea(glfwGetPrimaryMonitor(), &workX, &workY, &workW, &workH);
+    if (workW > 0 && workH > 0)
+    {
+        initialWidth  = workW * 3 / 4;
+        initialHeight = workH * 3 / 4;
+    }
+#else
     // Maximized, not exclusive fullscreen: still a real bordered OS window (so
     // the taskbar, Alt-Tab and "Open in New Window" popouts all behave exactly
     // as they already do), just starting at the size someone would otherwise
     // reach by clicking the maximize button once on launch.
     glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
+#endif
 
-    GLFWwindow* window = glfwCreateWindow(1600, 900, "Scope Deck", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(initialWidth, initialHeight, "Scope Deck", nullptr, nullptr);
     if (!window)
     {
         std::fprintf(stderr, "Failed to create a GL 3.3 core window.\n");
         glfwTerminate();
         return 1;
     }
+#ifdef __APPLE__
+    if (workW > 0 && workH > 0)
+        glfwSetWindowPos(window, workX + (workW - initialWidth) / 2, workY + (workH - initialHeight) / 2);
+#endif
 
     glfwMakeContextCurrent(window);
     glfwSwapInterval(g_GlVsync ? 1 : 0);   // see g_GlVsync
