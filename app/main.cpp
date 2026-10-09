@@ -8843,10 +8843,10 @@ void DrawFrame(App& p_App)
 
         if (ImGui::BeginMenu("Input"))
         {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
             const bool canCapture = true;
 #else
-            const bool canCapture = false;   // GDI capture only, see ScreenCapture.h
+            const bool canCapture = false;   // GDI / ScreenCaptureKit only, see ScreenCapture.h
 #endif
             const bool capturing = p_App.input == InputSource::ScreenCapture;
             const bool resolve   = p_App.input == InputSource::Resolve;

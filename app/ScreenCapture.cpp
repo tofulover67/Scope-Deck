@@ -22,6 +22,10 @@
 #include <timeapi.h>
 #endif
 
+#ifdef __APPLE__
+#include "mac/ScreenCaptureMac.h"
+#endif
+
 namespace scopedeck
 {
 
@@ -350,11 +354,113 @@ bool PickScreenRegion(ScreenRegion& p_Out)
     return picked;
 }
 
+#elif defined(__APPLE__)
+
+// An overlay per display, in app/mac/ScreenCaptureMac.mm.
+bool PickScreenRegion(ScreenRegion& p_Out) { return mac::PickScreenRegion(p_Out); }
+
 #else
 
 bool PickScreenRegion(ScreenRegion& /*p_Out*/) { return false; }
 
 #endif
+
+// ---------------------------------------------------------------------------
+// From captured pixels to a ScopeFrame
+// ---------------------------------------------------------------------------
+//
+// Every platform's grab ends in the same place - a BGRA8 picture, top row
+// first - and from there to the frame the panels read is one shared path, so
+// the platforms can't drift apart in what the scopes see.
+
+namespace
+{
+
+class CaptureAnalyser
+{
+public:
+    CaptureAnalyser()
+    {
+        for (int i = 0; i < 256; ++i) m_Lut[i] = static_cast<float>(i) / 255.0f;
+    }
+
+    // p_Stride is the bytes from one row to the next. p_FrameNo is this
+    // capture session's count, which stands in for timeline time. p_Frame's
+    // vectors are swapped with the engine's, not copied: the engine gets last
+    // frame's storage back, which Analyse reassigns anyway.
+    void Analyse(const uint8_t* p_BGRA, int p_Width, int p_Height, size_t p_Stride,
+                 uint64_t p_FrameNo, ScopeFrame& p_Frame)
+    {
+        const int w = p_Width;
+        const int h = p_Height;
+        m_RGBA.resize(static_cast<size_t>(w) * h * 4);
+
+        // BGRA8 top-down -> float RGBA, which is what ScopeEngine reads (the
+        // tap hands it Resolve's float frames).
+        for (int y = 0; y < h; ++y)
+        {
+            const uint8_t* src = p_BGRA + static_cast<size_t>(y) * p_Stride;
+            float* dst = m_RGBA.data() + static_cast<size_t>(y) * w * 4;
+            for (int x = 0; x < w; ++x, src += 4, dst += 4)
+            {
+                dst[0] = m_Lut[src[2]];
+                dst[1] = m_Lut[src[1]];
+                dst[2] = m_Lut[src[0]];
+                dst[3] = 1.0f;
+            }
+        }
+
+        // ScopeEngine's row 0 is the bottom of the picture (OFX's convention -
+        // BuildPreview flips on output). The capture is top-down, so the view
+        // starts at the last row and walks upwards.
+        FrameView view;
+        view.pixels   = m_RGBA.data() + static_cast<size_t>(h - 1) * w * 4;
+        view.width    = w;
+        view.height   = h;
+        view.rowBytes = -static_cast<int>(static_cast<size_t>(w) * 4 * sizeof(float));
+
+        m_Engine.Analyse(view, m_Params, m_Result);
+        m_Engine.BuildPreview(view, 1.0f, m_Result.preview);
+
+        // Exactly the fields ScopePublisher::Publish writes and
+        // ScopeReader::ReadSlot copies back out, without the round trip.
+        ScopeFrame& frame = p_Frame;
+        frame.timelineTime  = static_cast<double>(p_FrameNo);
+        frame.frameIndex    = NextFrameIdentity();
+        frame.width         = static_cast<uint32_t>(w);
+        frame.height        = static_cast<uint32_t>(h);
+        frame.instanceId    = 0;
+        frame.pixelsSampled = static_cast<uint32_t>(std::min<uint64_t>(m_Result.pixelsSampled, 0xFFFFFFFFull));
+        frame.binMillis     = m_Result.millis;
+        frame.colorSpace    = m_Result.colorSpace;
+        frame.lumaCoeff[0]  = m_Result.luma.r;
+        frame.lumaCoeff[1]  = m_Result.luma.g;
+        frame.lumaCoeff[2]  = m_Result.luma.b;
+        for (int c = 0; c < 3; ++c)
+        {
+            frame.minRGB[c]   = m_Result.minRGB[c];
+            frame.maxRGB[c]   = m_Result.maxRGB[c];
+            frame.probeRGB[c] = m_Result.probeRGB[c];
+        }
+        frame.previewWidth  = m_Result.preview.width;
+        frame.previewHeight = m_Result.preview.height;
+        frame.waveform.swap(m_Result.waveform);
+        frame.histogram.swap(m_Result.histogram);
+        frame.vectorscope.swap(m_Result.vectorscope);
+        frame.twinPeaks.swap(m_Result.twinPeaks);
+        frame.waveformTrace.swap(m_Result.waveformTrace);
+        frame.preview.swap(m_Result.preview.rgb);
+    }
+
+private:
+    float              m_Lut[256];
+    std::vector<float> m_RGBA;
+    ScopeEngine        m_Engine;
+    ScopeParams        m_Params;   // Rec.709, every row - screen content is display sRGB
+    ScopeResult        m_Result;
+};
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Capture thread
@@ -369,6 +475,9 @@ bool PickScreenRegion(ScreenRegion& /*p_Out*/) { return false; }
 struct ScreenCaptureSource::Impl
 {
     ScreenRegion       region;
+#ifdef __APPLE__
+    uint32_t           displayId = 0;   // the display region lies on
+#endif
     std::thread        worker;
     std::atomic<bool>  stop{ false };
 
@@ -407,15 +516,8 @@ void ScreenCaptureSource::Impl::Run()
     // barely 30. Raised for this thread's lifetime only.
     timeBeginPeriod(1);
 
-    float lut[256];
-    for (int i = 0; i < 256; ++i) lut[i] = static_cast<float>(i) / 255.0f;
-
-    std::vector<float> rgba(static_cast<size_t>(w) * h * 4);
-
-    ScopeEngine engine;
-    ScopeParams params;   // Rec.709, every row - screen content is display sRGB
-    ScopeResult result;
-    ScopeFrame  frame;
+    CaptureAnalyser analyser;
+    ScopeFrame      frame;
 
     const auto period = std::chrono::microseconds(16667);   // 60 Hz
     auto next = Clock::now();
@@ -440,62 +542,12 @@ void ScreenCaptureSource::Impl::Run()
             continue;
         }
 
-        // BGRA8 top-down -> float RGBA, which is what ScopeEngine reads (the
-        // tap hands it Resolve's float frames).
-        const uint8_t* src = static_cast<const uint8_t*>(bits);
-        float* dst = rgba.data();
-        const size_t pixels = static_cast<size_t>(w) * h;
-        for (size_t i = 0; i < pixels; ++i, src += 4, dst += 4)
-        {
-            dst[0] = lut[src[2]];
-            dst[1] = lut[src[1]];
-            dst[2] = lut[src[0]];
-            dst[3] = 1.0f;
-        }
-
-        // ScopeEngine's row 0 is the bottom of the picture (OFX's convention -
-        // BuildPreview flips on output). The capture is top-down, so the view
-        // starts at the last row and walks upwards.
-        FrameView view;
-        view.pixels   = rgba.data() + static_cast<size_t>(h - 1) * w * 4;
-        view.width    = w;
-        view.height   = h;
-        view.rowBytes = -static_cast<int>(static_cast<size_t>(w) * 4 * sizeof(float));
-
-        engine.Analyse(view, params, result);
-        engine.BuildPreview(view, 1.0f, result.preview);
-        const auto t2 = Clock::now();
-
-        // Exactly the fields ScopePublisher::Publish writes and
-        // ScopeReader::ReadSlot copies back out, without the round trip.
-        // Vectors are swapped, not copied: result gets last frame's storage
-        // back, which Analyse reassigns anyway.
+        // A DIB section's rows are DWORD-aligned, which for 32-bit pixels
+        // means exactly w * 4 bytes apart.
         ++frameNo;
-        frame.timelineTime  = static_cast<double>(frameNo);
-        frame.frameIndex    = NextFrameIdentity();
-        frame.width         = static_cast<uint32_t>(w);
-        frame.height        = static_cast<uint32_t>(h);
-        frame.instanceId    = 0;
-        frame.pixelsSampled = static_cast<uint32_t>(std::min<uint64_t>(result.pixelsSampled, 0xFFFFFFFFull));
-        frame.binMillis     = result.millis;
-        frame.colorSpace    = result.colorSpace;
-        frame.lumaCoeff[0]  = result.luma.r;
-        frame.lumaCoeff[1]  = result.luma.g;
-        frame.lumaCoeff[2]  = result.luma.b;
-        for (int c = 0; c < 3; ++c)
-        {
-            frame.minRGB[c]   = result.minRGB[c];
-            frame.maxRGB[c]   = result.maxRGB[c];
-            frame.probeRGB[c] = result.probeRGB[c];
-        }
-        frame.previewWidth  = result.preview.width;
-        frame.previewHeight = result.preview.height;
-        frame.waveform.swap(result.waveform);
-        frame.histogram.swap(result.histogram);
-        frame.vectorscope.swap(result.vectorscope);
-        frame.twinPeaks.swap(result.twinPeaks);
-        frame.waveformTrace.swap(result.waveformTrace);
-        frame.preview.swap(result.preview.rgb);
+        analyser.Analyse(static_cast<const uint8_t*>(bits), w, h, static_cast<size_t>(w) * 4,
+                         frameNo, frame);
+        const auto t2 = Clock::now();
 
         ++fpsWindowFrames;
         const double windowMs = MillisBetween(fpsWindowStart, t2);
@@ -528,6 +580,78 @@ void ScreenCaptureSource::Impl::Run()
     ReleaseDC(nullptr, screen);
 }
 
+#elif defined(__APPLE__)
+
+// ScreenCaptureKit pushes frames rather than being polled: the stream's
+// callback leaves the newest one for this thread and returns, and the
+// conversion and scopes run here, as on Windows. There is no 60 Hz timer -
+// the stream is capped at 60 fps itself, and sends nothing at all while the
+// region's content is still, so the fps reading falls to 0 over a paused
+// picture rather than re-analysing an unchanged one.
+void ScreenCaptureSource::Impl::Run()
+{
+    mac::ScreenStream stream;
+    std::string error;
+    if (!stream.Start(displayId, region, stop, error))
+    {
+        if (!error.empty()) SetError(error.c_str());
+        return;
+    }
+
+    CaptureAnalyser analyser;
+    ScopeFrame      frame;
+    uint64_t        frameNo = 0;
+
+    auto fpsWindowStart = Clock::now();
+    uint64_t fpsWindowFrames = 0;
+    double fps = 0.0;
+
+    while (!stop.load(std::memory_order_relaxed))
+    {
+        // Short waits, so Stop() is never held up by a still screen.
+        mac::ScreenFrame pixels;
+        const mac::ScreenStream::Wait got = stream.WaitFrame(100, pixels);
+        const auto t1 = Clock::now();
+
+        if (got == mac::ScreenStream::Wait::Failed)
+        {
+            SetError(stream.Error().c_str());
+            break;
+        }
+
+        const double msGrab = pixels.msGrab;   // Release clears it
+        if (got == mac::ScreenStream::Wait::Frame)
+        {
+            ++frameNo;
+            analyser.Analyse(pixels.bgra, pixels.width, pixels.height, pixels.stride, frameNo, frame);
+            stream.Release(pixels);
+            ++fpsWindowFrames;
+        }
+        const auto t2 = Clock::now();
+
+        const double windowMs = MillisBetween(fpsWindowStart, t2);
+        if (windowMs >= 500.0)
+        {
+            fps = fpsWindowFrames * 1000.0 / windowMs;
+            fpsWindowStart = t2;
+            fpsWindowFrames = 0;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        stats.fps = fps;
+        if (got != mac::ScreenStream::Wait::Frame) continue;
+
+        std::swap(latest, frame);
+        fresh = true;
+        stats.msGrab   = msGrab;
+        stats.msScopes = MillisBetween(t1, t2);
+        stats.frames   = frameNo;
+        stats.error.clear();
+    }
+
+    stream.Stop();
+}
+
 #else
 
 void ScreenCaptureSource::Impl::Run() {}
@@ -545,10 +669,20 @@ ScreenCaptureSource::~ScreenCaptureSource()
 bool ScreenCaptureSource::Start(const ScreenRegion& p_Region)
 {
     Stop();
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     if (!p_Region.IsValid()) return false;
 
+#ifdef __APPLE__
+    // Here rather than on the worker so Region() is the region actually
+    // captured from the moment Start() returns.
+    ScreenRegion fitted;
+    uint32_t displayId = 0;
+    if (!mac::FitRegionToDisplay(p_Region, fitted, displayId)) return false;
+    m_Impl->region = fitted;
+    m_Impl->displayId = displayId;
+#else
     m_Impl->region = p_Region;
+#endif
     m_Impl->stop = false;
     {
         std::lock_guard<std::mutex> lock(m_Impl->mutex);
