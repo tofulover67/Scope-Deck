@@ -15,12 +15,19 @@
 // live sample data or meter values (checked against Resolve's own OpenFX SDK
 // and Scripting README - see PORTING.md) - the same wall ERRORS.md already
 // hit trying to drive Resolve's transport. This instead captures Resolve's
-// own process output specifically, via Windows' per-process loopback
-// activation (`ActivateAudioInterfaceAsync` with
-// `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`) - the same mechanism behind
-// Windows 11's own per-app volume mixer and OBS's "audio output capture"
-// source - rather than the whole system's default output device, which would
-// also pick up whatever else on the machine happens to be making noise.
+// own process output specifically, rather than the whole system's default
+// output device, which would also pick up whatever else on the machine
+// happens to be making noise:
+//
+// - Windows: per-process loopback activation (`ActivateAudioInterfaceAsync`
+//   with `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`) - the same mechanism
+//   behind Windows 11's own per-app volume mixer and OBS's "audio output
+//   capture" source.
+// - macOS: a Core Audio process tap (macOS 14.2+), the same mechanism behind
+//   Audio Hijack and OBS's macOS app capture - see app/mac/AudioCaptureMac.mm.
+//
+// Everything after the capture itself - the peak/RMS/true-peak reduction,
+// the ring buffer, the staged status - is shared by both.
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -31,6 +38,9 @@
 #include <audioclientactivationparams.h>
 #include <propidl.h>
 #include <combaseapi.h>
+#elif defined(__APPLE__)
+#include "mac/AudioCaptureMac.h"
+#include "mac/MacPlatform.h"
 #endif
 
 namespace scopedeck
@@ -95,13 +105,102 @@ static void AppendRingSamples(const float* p_Interleaved, uint32_t p_Frames)
     g_AmRing.writeCount += p_Frames;
 }
 
-#ifdef _WIN32
-
 static float LinearToDb(float p_Linear)
 {
     constexpr float kFloor = 1e-5f;   // -100 dB
     return 20.0f * std::log10(std::max(p_Linear, kFloor));
 }
+
+// Catmull-Rom cubic through four consecutive samples, evaluated at t in
+// [0,1] between p1 and p2 - the interpolation kernel True Peak below uses to
+// estimate what the waveform actually does *between* samples.
+static float CatmullRom(float p0, float p1, float p2, float p3, float t)
+{
+    const float t2 = t * t, t3 = t2 * t;
+    return 0.5f * ((2.0f * p1) + (-p0 + p2) * t
+                  + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2
+                  + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+}
+
+// Fixed float32/kChannels layout on both platforms (Windows asks WASAPI for
+// it - see LoopbackStream::Open; macOS's stereo mixdown tap delivers it and
+// AudioCaptureMac.mm interleaves it), so this needs no format-detection
+// branching at all - unlike a whole-device capture, which has to cope with
+// whatever format that device's own mix happens to be.
+static void AccumulatePacket(const uint8_t* p_Data, uint32_t p_Frames, bool p_Silent, AudioMeterLevels& p_Out)
+{
+    constexpr int channels = AudioRingSnapshot::kChannels;
+    p_Out.channelCount = channels;
+    p_Out.deviceOk      = true;
+
+    float  peak[AudioMeterLevels::kMaxChannels]     = {};
+    float  truePeak[AudioMeterLevels::kMaxChannels] = {};
+    double sumSquares[AudioMeterLevels::kMaxChannels] = {};
+
+    if (!p_Silent && p_Frames > 0)
+    {
+        const float* samples = reinterpret_cast<const float*>(p_Data);
+
+        for (uint32_t f = 0; f < p_Frames; ++f)
+        {
+            for (int c = 0; c < channels; ++c)
+            {
+                const float sample = samples[size_t(f) * channels + c];
+                const float mag    = std::fabs(sample);
+                if (mag > peak[c]) peak[c] = mag;
+                sumSquares[c] += double(sample) * double(sample);
+            }
+        }
+
+        // True Peak: a real 4x-oversampled inter-sample estimate (Catmull-Rom
+        // interpolation between consecutive samples), NOT a certified
+        // ITU-R BS.1770-4 measurement - that standard specifies exact
+        // polyphase FIR filter coefficients this doesn't reproduce, the same
+        // "not claimed as verified [standard] compliance" disclosure this
+        // project already gives its EBU R103 Signal Pre-filter. What this
+        // does catch, honestly: the actual problem True Peak exists for -
+        // a waveform that peaks *between* samples (common after upstream
+        // gain/EQ) reads safely under 0dBFS on a plain sample-peak meter and
+        // then clips for real once a downstream lossy codec or D/A converter
+        // reconstructs the continuous waveform. Edge-clamped per packet (no
+        // continuity carried across the ~10-20ms packet boundary), so an
+        // inter-sample peak landing exactly on a boundary is a rare, small
+        // blind spot, not a systematic one.
+        constexpr int kOversample = 4;
+        auto sampleAt = [&](int f, int c) -> float {
+            const int clamped = std::clamp(f, 0, int(p_Frames) - 1);
+            return samples[size_t(clamped) * channels + c];
+        };
+        for (uint32_t f = 0; f + 1 < p_Frames; ++f)
+        {
+            for (int c = 0; c < channels; ++c)
+            {
+                const float p0 = sampleAt(int(f) - 1, c);
+                const float p1 = sampleAt(int(f),     c);
+                const float p2 = sampleAt(int(f) + 1, c);
+                const float p3 = sampleAt(int(f) + 2, c);
+                for (int k = 1; k < kOversample; ++k)   // k=0 is p1 itself, already in peak[] above
+                {
+                    const float t = float(k) / float(kOversample);
+                    const float interp = std::fabs(CatmullRom(p0, p1, p2, p3, t));
+                    if (interp > truePeak[c]) truePeak[c] = interp;
+                }
+            }
+        }
+    }
+
+    for (int c = 0; c < channels; ++c)
+    {
+        const float rms = p_Frames > 0 ? float(std::sqrt(sumSquares[c] / double(p_Frames))) : 0.0f;
+        p_Out.peakDb[c]     = LinearToDb(peak[c]);
+        p_Out.rmsDb[c]      = LinearToDb(rms);
+        // Never below the sample peak - a true peak is, by construction, at
+        // least as high as the highest actual sample.
+        p_Out.truePeakDb[c] = LinearToDb(std::max(peak[c], truePeak[c]));
+    }
+}
+
+#ifdef _WIN32
 
 // The target host's process id (Resolve's or Premiere's), found by exe name
 // in the process list - matched by filename rather than any window title (a
@@ -224,6 +323,7 @@ private:
 struct LoopbackStream
 {
     static constexpr int kChannels = 2;
+    static_assert(kChannels == AudioRingSnapshot::kChannels, "AccumulatePacket and the ring assume this layout");
 
     IAudioClient*              audioClient   = nullptr;
     IAudioCaptureClient*       captureClient = nullptr;
@@ -370,93 +470,6 @@ struct LoopbackStream
     ~LoopbackStream() { Close(); }
 };
 
-// Catmull-Rom cubic through four consecutive samples, evaluated at t in
-// [0,1] between p1 and p2 - the interpolation kernel True Peak below uses to
-// estimate what the waveform actually does *between* samples.
-static float CatmullRom(float p0, float p1, float p2, float p3, float t)
-{
-    const float t2 = t * t, t3 = t2 * t;
-    return 0.5f * ((2.0f * p1) + (-p0 + p2) * t
-                  + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2
-                  + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
-}
-
-// Fixed float32/kChannels layout (see LoopbackStream::Open), so this needs no
-// format-detection branching at all - unlike a whole-device capture, which
-// has to cope with whatever format that device's own mix happens to be.
-static void AccumulatePacket(const BYTE* p_Data, UINT32 p_Frames, bool p_Silent, AudioMeterLevels& p_Out)
-{
-    constexpr int channels = LoopbackStream::kChannels;
-    p_Out.channelCount = channels;
-    p_Out.deviceOk      = true;
-
-    float  peak[AudioMeterLevels::kMaxChannels]     = {};
-    float  truePeak[AudioMeterLevels::kMaxChannels] = {};
-    double sumSquares[AudioMeterLevels::kMaxChannels] = {};
-
-    if (!p_Silent && p_Frames > 0)
-    {
-        const float* samples = reinterpret_cast<const float*>(p_Data);
-
-        for (UINT32 f = 0; f < p_Frames; ++f)
-        {
-            for (int c = 0; c < channels; ++c)
-            {
-                const float sample = samples[size_t(f) * channels + c];
-                const float mag    = std::fabs(sample);
-                if (mag > peak[c]) peak[c] = mag;
-                sumSquares[c] += double(sample) * double(sample);
-            }
-        }
-
-        // True Peak: a real 4x-oversampled inter-sample estimate (Catmull-Rom
-        // interpolation between consecutive samples), NOT a certified
-        // ITU-R BS.1770-4 measurement - that standard specifies exact
-        // polyphase FIR filter coefficients this doesn't reproduce, the same
-        // "not claimed as verified [standard] compliance" disclosure this
-        // project already gives its EBU R103 Signal Pre-filter. What this
-        // does catch, honestly: the actual problem True Peak exists for -
-        // a waveform that peaks *between* samples (common after upstream
-        // gain/EQ) reads safely under 0dBFS on a plain sample-peak meter and
-        // then clips for real once a downstream lossy codec or D/A converter
-        // reconstructs the continuous waveform. Edge-clamped per packet (no
-        // continuity carried across the ~10-20ms packet boundary), so an
-        // inter-sample peak landing exactly on a boundary is a rare, small
-        // blind spot, not a systematic one.
-        constexpr int kOversample = 4;
-        auto sampleAt = [&](int f, int c) -> float {
-            const int clamped = std::clamp(f, 0, int(p_Frames) - 1);
-            return samples[size_t(clamped) * channels + c];
-        };
-        for (UINT32 f = 0; f + 1 < p_Frames; ++f)
-        {
-            for (int c = 0; c < channels; ++c)
-            {
-                const float p0 = sampleAt(int(f) - 1, c);
-                const float p1 = sampleAt(int(f),     c);
-                const float p2 = sampleAt(int(f) + 1, c);
-                const float p3 = sampleAt(int(f) + 2, c);
-                for (int k = 1; k < kOversample; ++k)   // k=0 is p1 itself, already in peak[] above
-                {
-                    const float t = float(k) / float(kOversample);
-                    const float interp = std::fabs(CatmullRom(p0, p1, p2, p3, t));
-                    if (interp > truePeak[c]) truePeak[c] = interp;
-                }
-            }
-        }
-    }
-
-    for (int c = 0; c < channels; ++c)
-    {
-        const float rms = p_Frames > 0 ? float(std::sqrt(sumSquares[c] / double(p_Frames))) : 0.0f;
-        p_Out.peakDb[c]     = LinearToDb(peak[c]);
-        p_Out.rmsDb[c]      = LinearToDb(rms);
-        // Never below the sample peak - a true peak is, by construction, at
-        // least as high as the highest actual sample.
-        p_Out.truePeakDb[c] = LinearToDb(std::max(peak[c], truePeak[c]));
-    }
-}
-
 static void CaptureThread()
 {
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED)))
@@ -575,11 +588,181 @@ static void CaptureThread()
     CoUninitialize();
 }
 
-#endif // _WIN32
+#elif defined(__APPLE__)
+
+// Bundle id of the host to tap. Premiere has no other support on macOS, so
+// asking for it simply reports "isn't running" unless it happens to be.
+static const char* TargetBundleId(int p_Target)
+{
+    return (p_Target == static_cast<int>(AudioTarget::Premiere)) ? mac::kPremiereBundleId : mac::kResolveBundleId;
+}
+
+// When the tap last delivered a buffer, in steady_clock nanoseconds - written
+// on Core Audio's I/O thread, read by the supervisor below for the idle decay.
+static std::atomic<int64_t> g_AmLastBufferNs{ 0 };
+
+static int64_t SteadyNowNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// The tap runs at whatever rate the host's output device does, unlike
+// Windows' fixed 48 kHz. A change empties the ring rather than leave the
+// Spectrum Analyzer reading old-rate samples against the new rate's
+// frequency axis - CopyLastFrames' callers already cope with a ring that
+// has not filled yet.
+static void SetRingSampleRate(int p_SampleRate)
+{
+    if (p_SampleRate <= 0) return;
+    std::lock_guard<std::mutex> lock(g_AmMutex);
+    if (g_AmRing.sampleRate != p_SampleRate)
+    {
+        g_AmRing.sampleRate = p_SampleRate;
+        g_AmRing.writeCount = 0;
+    }
+}
+
+// The per-buffer half of what Windows' CaptureThread does per packet, run
+// on Core Audio's I/O thread as each buffer arrives instead of polled for -
+// the mutex-guarded publishes are short copies, fine for a meter. Digital
+// silence is published like any other buffer, the way Windows publishes a
+// SILENT packet: a tapped host that is paused reads as a meter at the floor,
+// not as "waiting for audio".
+static void OnTapFrames(const float* p_Interleaved, uint32_t p_Frames, void*)
+{
+    AudioMeterLevels levels;
+    levels.status = AudioMeterStatus::Capturing;
+    AccumulatePacket(reinterpret_cast<const uint8_t*>(p_Interleaved), p_Frames, false, levels);
+    PublishLevels(levels);
+    AppendRingSamples(p_Interleaved, p_Frames);
+    g_AmLastBufferNs.store(SteadyNowNs(), std::memory_order_relaxed);
+}
+
+// The supervisor: opens, closes and retries the tap, and notices the host
+// going away - the buffers themselves never pass through here (see
+// OnTapFrames). Same states and the same once-a-second retry as Windows'
+// CaptureThread, so the panel's status reads the same on both.
+static void CaptureThread()
+{
+    mac::ProcessAudioTap tap;
+    bool opened       = false;
+    int  openedTarget = -1;   // whose process the open tap taps
+    int  hostPid      = 0;
+    auto lastWatch    = std::chrono::steady_clock::now();
+    mac::AudioCapturePermission openedPermission = mac::AudioCapturePermission::Unknown;
+
+    while (!g_AmQuit)
+    {
+        const bool active = g_AmActive.load(std::memory_order_relaxed);
+        const int  target = g_AmTarget.load(std::memory_order_relaxed);
+
+        // The input switched hosts: drop the old host's tap; the pass below
+        // opens the new one's.
+        if (opened && target != openedTarget)
+        {
+            tap.Close();
+            opened = false;
+        }
+
+        if (!active)
+        {
+            if (opened) { tap.Close(); opened = false; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+
+        if (!opened)
+        {
+            AudioMeterLevels openResult;
+            long             openStatus = 0;
+            int              sampleRate = 0;
+
+            // Re-resolved every time, never remembered: a restarted host is
+            // a new pid.
+            const char* bundleId = TargetBundleId(target);
+            hostPid = mac::RunningAppPid(bundleId);
+            if (hostPid == 0)
+            {
+                openResult.status = AudioMeterStatus::ResolveNotFound;
+            }
+            else
+            {
+                openedPermission = mac::QueryAudioCapturePermission();
+                opened = tap.Open(hostPid, bundleId, OnTapFrames, nullptr, openResult.status, openStatus, sampleRate);
+            }
+            openedTarget = target;
+            openResult.lastHresult = openStatus;
+            if (opened)
+            {
+                SetRingSampleRate(sampleRate);
+                g_AmLastBufferNs.store(SteadyNowNs(), std::memory_order_relaxed);
+            }
+            PublishLevels(openResult);   // deviceOk stays false either way - true only once a real buffer lands
+
+            if (!opened)
+            {
+                // A second between retries, in steps, so closing the app is
+                // not held up by however much of it is left.
+                for (int i = 0; i < 10 && !g_AmQuit; ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            lastWatch = std::chrono::steady_clock::now();
+        }
+
+        // The host exited. Unlike WASAPI, a tap does not fail when its
+        // process goes away - it just goes on delivering silence - so this
+        // has to be noticed here rather than by an error. The next pass
+        // looks for the host fresh.
+        if (!mac::ProcessAlive(hostPid))
+        {
+            tap.Close();
+            opened = false;
+            continue;
+        }
+
+        // Once a second, the things that make the open tap stale without
+        // making it fail: the host's helper processes or the output's sample
+        // rate changed under it (see ProcessAudioTap::IsStale), or the user
+        // changed the audio recording permission since the tap was made - a
+        // tap made before the permission was granted stays silent. Either
+        // way, start over; a denial is then reported by the reopen itself.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastWatch >= std::chrono::seconds(1))
+        {
+            lastWatch = now;
+            if (tap.IsStale() || mac::QueryAudioCapturePermission() != openedPermission)
+            {
+                tap.Close();
+                opened = false;
+                continue;
+            }
+        }
+
+        // Nothing new - the host itself may still be running but not
+        // playing (a tap only starts delivering once its process first makes
+        // sound). Decay to silence after a beat rather than holding whatever
+        // level was last measured indefinitely.
+        const int64_t sinceBufferNs = SteadyNowNs() - g_AmLastBufferNs.load(std::memory_order_relaxed);
+        if (sinceBufferNs > int64_t(500) * 1000000)
+        {
+            AudioMeterLevels idle;
+            idle.status = AudioMeterStatus::Capturing;   // tap is fine, just nothing arriving
+            PublishLevels(idle);
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    if (opened) tap.Close();
+}
+
+#endif // _WIN32 / __APPLE__
 
 void AudioMeterBridgeStart()
 {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     g_AmQuit = false;
     g_AmThread = std::thread(CaptureThread);
 #endif
@@ -587,7 +770,7 @@ void AudioMeterBridgeStart()
 
 void AudioMeterBridgeStop()
 {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     g_AmQuit = true;
     if (g_AmThread.joinable())
         g_AmThread.join();

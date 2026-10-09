@@ -5,23 +5,33 @@
 
 namespace scopedeck
 {
+    // Whose audio to tap: the host that is the app's input. Premiere plays
+    // through its own process exactly as Resolve does, so the same
+    // per-process capture serves both - only the process differs.
+    enum class AudioTarget { Resolve, Premiere };
+
     // Which stage the capture thread is currently at - surfaced in the panel
     // instead of one flat "no audio" message, since "Resolve isn't running",
     // "found Resolve but couldn't tap its audio", and "tapped it, just
     // nothing playing right now" are three very different things to see
     // while chasing down why the meter reads silence.
-    // Whose audio to tap: the host that is the app's input. Premiere plays
-    // through its own process exactly as Resolve does, so the same
-    // per-process loopback capture serves both - only the exe differs.
-    enum class AudioTarget { Resolve, Premiere };
-
+    //
+    // The stage names come from Windows' WASAPI activation; macOS maps its
+    // Core Audio process tap onto them stage for stage (see each comment),
+    // with lastHresult carrying the OSStatus instead of an HRESULT.
     enum class AudioMeterStatus
     {
         ResolveNotFound,        // the target host's process isn't running (named for the original target)
-        ActivationCallFailed,   // ActivateAudioInterfaceAsync's own synchronous return failed
-        ActivationTimedOut,     // ActivateCompleted never fired within the wait
-        ActivationResultFailed, // ActivateCompleted fired, but GetActivateResult reported failure
-        StreamInitFailed,       // activation succeeded but IAudioClient::Initialize/GetService/Start didn't
+        ActivationCallFailed,   // Windows: ActivateAudioInterfaceAsync's own synchronous return failed
+                                // macOS: AudioHardwareCreateProcessTap failed (or the tap's format is unusable)
+        ActivationTimedOut,     // Windows: ActivateCompleted never fired within the wait (never on macOS)
+        ActivationResultFailed, // Windows: ActivateCompleted fired, but GetActivateResult reported failure
+                                // macOS: the tap exists but AudioHardwareCreateAggregateDevice failed
+        StreamInitFailed,       // Windows: activation succeeded but IAudioClient::Initialize/GetService/Start didn't
+                                // macOS: the aggregate device exists but its IOProc couldn't be created or started
+        PermissionDenied,       // macOS only: the user said no to System Audio Recording for this app
+        HostHasNoAudio,         // macOS only: the host is running but has never opened audio, so there
+                                // is no Core Audio process object to tap yet (retried every second)
         Capturing,              // stream open and running - see AudioMeterLevels::deviceOk
                                 // for whether a real (non-silent) packet has arrived yet
     };
@@ -64,12 +74,12 @@ namespace scopedeck
     // not a hot path worth a lock-free ring for.
     struct AudioRingSnapshot
     {
-        static constexpr int kChannels = 2;      // matches LoopbackStream::kChannels
+        static constexpr int kChannels = 2;      // the stereo the capture delivers on both platforms
         static constexpr int kCapacity = 8192;   // ~170ms at 48kHz - enough for a 4096-sample FFT window with headroom
 
         float    samples[kCapacity * kChannels] = {};   // interleaved, circular - see CopyLastFrames
         uint64_t writeCount                     = 0;    // total frames ever written (not wrapped)
-        int      sampleRate                     = 48000;
+        int      sampleRate                     = 48000;   // of the samples above - fixed on Windows, the tap's real rate on macOS
 
         // Unwraps the circular buffer into chronological (oldest-first)
         // order so callers never have to reason about the write position -
@@ -99,7 +109,8 @@ namespace scopedeck
     void AudioMeterBridgeStop();
 
     // Call every frame to tell the bridge whether any Audio Meter/Goniometer/
-    // Spectrum Analyzer panel is open - the WASAPI loopback stream is only
+    // Spectrum Analyzer panel is open - the capture stream (WASAPI process
+    // loopback on Windows, a Core Audio process tap on macOS) is only
     // opened while something actually needs it, same reasoning as
     // TimecodeBridgeSetActive. One stream feeds all three consumers.
     void AudioMeterBridgeSetActive(bool p_Active);
