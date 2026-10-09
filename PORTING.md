@@ -10,6 +10,37 @@ Status legend: Ported (full parity, or a deliberate redesign noted inline) /
 Partial (missing some settings or a sub-feature) / Missing (not started) /
 Skipped (deliberately not being ported).
 
+## macOS port (2026-10-10)
+
+The tree builds and runs on macOS from the same sources - `build_mac.sh`,
+`deploy_mac.sh`, `release_mac.sh` beside the PowerShell scripts, one release
+workflow for both. Verified on an Apple silicon Mac (macOS 27, Command Line
+Tools only, DaVinci Resolve 21.0.4): the app bundle, the universal ScopeTap
+bundle, all 640 conformance cases and the publish-contention gate. Where
+each Windows-only piece went:
+
+| Subsystem | macOS | Notes |
+|---|---|---|
+| App window, panels, docking, pop-outs | Ported | GLFW + ImGui as on Windows. Retina handled by the framebuffer scale: the style is *not* scaled by the content scale on macOS (ImGui's GLFW backend reports 1.0 per viewport there), see `RenderOneFrame`. Solo Fills the Screen uses the GLFW-only branch that already existed. |
+| Shared memory (`ScopeShm`/`ScopeReader`) | Ported (pre-existing) | POSIX `shm_open` branch; names `/ScopeDeck.v1` and `/ScopeDeck.Premiere.v1` sit under macOS's 31-character limit. The Mac reader maps read/write (no `FILE_MAP_READ` equivalent used). |
+| ScopeTap (Resolve) | Ported, CPU path | `ScopeTap.ofx.bundle/Contents/MacOS/ScopeTap.ofx` with an Info.plist, installed to `/Library/OFX/Plugins`. No CUDA on macOS; a Metal path is a separate project (GPU_PORT_HANDOFF.md §5d). "Open Scope Deck" launches the app by bundle id through `/usr/bin/open`. |
+| ScopeTransmit (Premiere) | Skipped | Windows-only SDK and build; the Input menu still offers Premiere but nothing publishes on a Mac. |
+| Timecode / Subtitle bridges | Ported | Same persistent Python worker, over `posix_spawn` + pipes (`app/PosixProcess.*`). Python found in python.org's framework, Homebrew, or the Command Line Tools' - never a bare `/usr/bin/python3`, which is an install-prompt stub without them. The installer adds python.org's Python when the Mac has none. Needs Resolve's external scripting (Resolve Studio; the free edition's `scriptapp` returns None). |
+| Load Still (Compare panel) | Ported | NSOpenPanel (`app/mac/MacPlatform.mm`). |
+| Layout, presets | Ported | `~/Library/Application Support/Scope Deck/layout.ini` and `presets/`. |
+| Space Brings Resolve to Focus | Ported | `NSRunningApplication` by bundle id, with macOS 14's cooperative activation. |
+| Subtitle overlay fonts | Ported | Hiragino Sans W3/W6, then Hiragino Sans GB, then AppleGothic. |
+| Audio Meter / Goniometer / Spectrum Analyzer | Ported | Core Audio process tap on Resolve's process (macOS 14.2+), `app/mac/AudioCaptureMac.mm`: `CATapDescription` stereo mixdown inside a private aggregate device, IOProc delivering interleaved float at the device's real rate (the ring buffer carries it). Helper processes of the host are included, like Windows' process-tree loopback. Permission is the "System Audio Recording Only" prompt (macOS 14.4+), and a denied tap is detected rather than read as silence - two macOS-only statuses, `PermissionDenied` and `HostHasNoAudio`. |
+| Screen Capture input | Ported | `app/mac/ScreenCaptureMac.mm`: a transparent overlay for the region picker (no screenshot, so no permission needed just to pick) and a ScreenCaptureKit stream for the capture itself (Screen Recording permission). |
+| GPU Acceleration (tap) | Missing on macOS | CPU path only. |
+| Installer | Ported | `ScopeDeck-<version>.pkg` (unsigned, universal): the app into /Applications, the OFX bundle into /Library/OFX/Plugins, python.org's Python if absent. |
+
+Floating point: clang contracts multiply-adds on arm64 by default, which put
+160 conformance cases one ULP off the reference on the first Apple silicon
+run. `-ffp-contract=off` is now set for the whole tree on every non-MSVC
+compiler (CMakeLists.txt), so the Mac CPU path, the Windows CPU path and the
+reference agree bit-for-bit.
+
 ## Fixed: Colorize made Enhanced Render ~4x more expensive, and it was none of
 ## the things it looked like
 

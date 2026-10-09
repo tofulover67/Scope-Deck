@@ -816,10 +816,14 @@ checkbox is a different measurement.
 
 ### 5d. Then Metal, then OpenCL - but decide the order deliberately
 
-The original plan had Metal second. **This tree has never been built on macOS**
-(`ScopeTap.cpp` says the launch path there is unverified), so Metal second means
-standing up an entire macOS build-and-test environment before any Windows AMD or
-Intel user gets anything. That may still be right if the Mac colourist audience
+The original plan had Metal second. This tree had never been built on macOS when
+this was written; **as of 2026-10-10 it has** (see PORTING.md, "macOS port"):
+the app, the CPU ScopeTap and both gates build and pass on Apple silicon, so a
+Metal port now starts from a working macOS tree rather than from nothing. Note
+Metal shader compilation needs either Xcode (`xcrun metal`) or runtime
+compilation from source; the Command Line Tools alone do not carry the Metal
+compiler. Metal second still means a different audience than Windows AMD or
+Intel users getting anything. That may still be right if the Mac colourist audience
 is the bigger commercial prize - but it is a business call, not a technical one,
 and it has never actually been made.
 
