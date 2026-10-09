@@ -122,7 +122,8 @@ components="$build_dir/components.plist"
 pkgbuild --analyze --root "$pkgroot" "$components" > /dev/null
 i=0
 while /usr/libexec/PlistBuddy -c "Print :$i" "$components" > /dev/null 2>&1; do
-    /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" "$components"
+    /usr/libexec/PlistBuddy -c "Delete :$i:BundleIsRelocatable" "$components" > /dev/null 2>&1 || true
+    /usr/libexec/PlistBuddy -c "Add :$i:BundleIsRelocatable bool false" "$components"
     i=$((i + 1))
 done
 
