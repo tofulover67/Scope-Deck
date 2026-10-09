@@ -10,6 +10,13 @@
 #include <vector>
 #include <string>
 
+#ifndef _WIN32
+#include "PosixProcess.h"
+#endif
+#ifdef __APPLE__
+#include "mac/MacPlatform.h"
+#endif
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -379,16 +386,31 @@ static bool ParseCues(const std::string& p_Json, std::vector<SubtitleCue>& p_Out
     return true;
 }
 
+#ifndef _WIN32
+// See TimecodeBridge.cpp's PosixWorkerScriptPath.
+static std::string PosixWorkerScriptPath()
+{
+#ifdef __APPLE__
+    return mac::ResourcePath("subtitle_poll_worker.py");
+#else
+    return "subtitle_poll_worker.py";
+#endif
+}
+#endif
+
 static void SubtitlePollThread()
 {
 #ifdef _WIN32
     const std::string launcher = ResolvePythonLauncher();
+#else
+    const std::string launcher = FindPythonLauncher();
+    PosixWorker worker;
+#endif
     {
         std::lock_guard<std::mutex> lock(g_SubMutex);
         g_SubInfo.pythonChecked = true;
         g_SubInfo.pythonFound   = !launcher.empty();
     }
-#endif
 
     while (!g_SubQuit)
     {
@@ -398,10 +420,8 @@ static void SubtitlePollThread()
             needsPoll = g_SubInfo.active;
         }
 
-#ifdef _WIN32
         if (needsPoll && launcher.empty())
             needsPoll = false;   // nothing to run - see pythonFound above
-#endif
 
         if (needsPoll)
         {
@@ -456,15 +476,21 @@ static void SubtitlePollThread()
                 }
             }
 #else
-            // Non-Windows still spawns one-shot per poll, same as
-            // TimecodeBridge's own non-Windows path (see MAC_PORTING.md).
-            FILE* pipe = popen("python3 subtitle_poll_worker.py --once", "r");
-            if (pipe) {
-                char buffer[4096];
-                while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                    result += buffer;
+            // The Windows branch above over posix_spawn and pipes
+            // (PosixProcess.h) - same worker, same minute-long read timeout
+            // for the same reason, same "cues survive a dead worker" rule.
+            if (!worker.IsRunning())
+                worker.Start({ launcher, PosixWorkerScriptPath() }, "");
+
+            if (worker.IsRunning())
+            {
+                bool ok = worker.WriteLine("poll\n");
+                if (ok)
+                    ok = worker.ReadLine(result, 60000, &g_SubQuit);
+                if (!ok) {
+                    worker.Stop();
+                    result.clear();
                 }
-                pclose(pipe);
             }
 #endif
             // A failure line ({"error": ...}) clears the cues outright -
@@ -521,6 +547,8 @@ static void SubtitlePollThread()
 
 #ifdef _WIN32
     StopPersistentWorker();
+#else
+    worker.Stop();
 #endif
 }
 

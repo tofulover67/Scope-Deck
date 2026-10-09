@@ -40,6 +40,13 @@
   #define GLFW_EXPOSE_NATIVE_WIN32
   #include <GLFW/glfw3native.h>
   #include <dwmapi.h>
+#else
+  #include <csignal>    // SIGPIPE, see main()
+  #include <dirent.h>   // ListLayoutPresets
+  #include <sys/stat.h> // mkdir, GetPresetsDir
+#endif
+#ifdef __APPLE__
+  #include "mac/MacPlatform.h"
 #endif
 
 #include <algorithm>
@@ -1862,6 +1869,11 @@ std::string GetPresetsDir()
         ::CreateDirectoryA(dir.c_str(), nullptr);
         return dir;
     }
+#elif defined(__APPLE__)
+    // ~/Library/Application Support/Scope Deck/presets - beside layout.ini.
+    const std::string dir = mac::AppSupportDir() + "/presets";
+    ::mkdir(dir.c_str(), 0755);   // harmless if it exists
+    return dir;
 #else
     const char* home = std::getenv("HOME");
     if (home && *home)
@@ -1885,7 +1897,12 @@ std::string SanitizePresetFileName(const std::string& p_Name)
 
 std::string PresetPath(const std::string& p_Name)
 {
-    return GetPresetsDir() + "\\" + SanitizePresetFileName(p_Name) + ".ini";
+#ifdef _WIN32
+    const char* sep = "\\";
+#else
+    const char* sep = "/";
+#endif
+    return GetPresetsDir() + sep + SanitizePresetFileName(p_Name) + ".ini";
 }
 
 std::vector<std::string> ListLayoutPresets()
@@ -1902,6 +1919,17 @@ std::vector<std::string> ListLayoutPresets()
             if (name.size() > 4) names.push_back(name.substr(0, name.size() - 4));
         } while (::FindNextFileA(h, &findData));
         ::FindClose(h);
+    }
+#else
+    if (DIR* dir = ::opendir(GetPresetsDir().c_str()))
+    {
+        while (dirent* entry = ::readdir(dir))
+        {
+            const std::string name = entry->d_name;
+            if (name.size() > 4 && name.compare(name.size() - 4, 4, ".ini") == 0)
+                names.push_back(name.substr(0, name.size() - 4));
+        }
+        ::closedir(dir);
     }
 #endif
     std::sort(names.begin(), names.end());
@@ -8025,7 +8053,11 @@ void DrawPreferences(Preferences& p_Prefs)
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Panel arrangement, window size and every scope setting are\n"
                           "restored on next launch.\n"
+#ifdef _WIN32
                           "Stored in %%LOCALAPPDATA%%\\ScopeDeck\\layout.ini");
+#else
+                          "Stored in ~/Library/Application Support/Scope Deck/layout.ini");
+#endif
 
     ImGui::Checkbox("Solo Fills the Screen", &p_Prefs.soloFullScreen);
     if (ImGui::IsItemHovered())
@@ -8225,7 +8257,11 @@ void DrawStatusBar(App& p_App)
             char buf[192];
             std::snprintf(buf, sizeof(buf),
                           "Wire format mismatch: shared memory is v%u, this app reads v%u. "
+#ifdef _WIN32
                           "The %s in Program Files is out of date.",
+#else
+                          "The installed %s is out of date.",
+#endif
                           r.ShmVersion(), ScopeReader::ExpectedVersion(),
                           (p_App.input == InputSource::Premiere) ? "ScopeTransmit.prm" : "ScopeTap.ofx");
             colour = kColError;
@@ -9074,6 +9110,13 @@ void FocusHostWindow(InputSource p_Host)
 
     SetForegroundWindow(data.found);
 }
+#elif defined(__APPLE__)
+// The same job through NSRunningApplication, by bundle id - no window
+// enumeration needed, Cocoa knows which app is which. See MacPlatform.mm.
+void FocusHostWindow(InputSource p_Host)
+{
+    mac::ActivateApp(p_Host == InputSource::Premiere ? mac::kPremiereBundleId : mac::kResolveBundleId);
+}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -9379,8 +9422,19 @@ void RenderOneFrame(GLFWwindow* p_Window, RenderContext& p_Ctx)
     // ImGuiStyle - doing that mid-frame would change padding under widgets
     // that had already been laid out against the old values.
     {
-        float scaleX = 1.0f, scaleY = 1.0f;
+        float scaleX = 1.0f;
+#ifndef __APPLE__
+        float scaleY = 1.0f;
         glfwGetWindowContentScale(p_Window, &scaleX, &scaleY);
+#else
+        // On macOS the content scale (2.0 on a Retina display) is already
+        // spent on the framebuffer: GLFW sizes windows in points, ImGui lays
+        // out in points and its GLFW backend reports a DPI scale of 1.0 for
+        // every viewport (see ImGui_ImplGlfw_GetContentScaleForWindow), with
+        // the framebuffer scale making the result sharp. Scaling the style by
+        // it as well would double every size a second time.
+        (void)p_Window;
+#endif
 
         if (p_Ctx.forcedDpiScale > 0.0f) scaleX = p_Ctx.forcedDpiScale;
 
@@ -9496,7 +9550,7 @@ void RenderOneFrame(GLFWwindow* p_Window, RenderContext& p_Ctx)
     if (app.fullScreen.window && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Escape, false))
         app.soloPanelId = -1;
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     // Checked here, once per frame right after NewFrame settles this frame's
     // input edge-detection - not earlier, or IsKeyPressed would still be
     // reading last frame's state. WantTextInput (not WantCaptureKeyboard, a
@@ -9615,6 +9669,13 @@ int main(int argc, char** argv)
     }
 #endif
 
+#ifndef _WIN32
+    // A Python worker that has just died turns the next write to its stdin
+    // into SIGPIPE, which would kill the app outright. Ignored, the write
+    // fails with EPIPE and the bridge relaunches the worker (PosixProcess.cpp).
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
+
     glfwSetErrorCallback(GlfwErrorCallback);
     if (!glfwInit())
     {
@@ -9709,6 +9770,8 @@ int main(int argc, char** argv)
             ::CreateDirectoryA(dir.c_str(), nullptr);   // harmless if it exists
             return dir + "\\layout.ini";
         }
+#elif defined(__APPLE__)
+        return mac::AppSupportDir() + "/layout.ini";
 #else
         const char* home = std::getenv("HOME");
         if (home && *home)
@@ -9721,7 +9784,7 @@ int main(int argc, char** argv)
 
     ApplyDpiScale(1.0f);
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     // The atlas's very first added font becomes ImGui's implicit default for
     // every window that doesn't push its own - which is every panel in this
     // app. Adding it explicitly here, before the CJK font below, keeps that
@@ -9753,6 +9816,27 @@ int main(int argc, char** argv)
         struct SubtitleFamily { SubtitleFace faces[(int)SubtitleStyle::Count]; };
 
         static const SubtitleFamily kFamilies[] = {
+#ifdef __APPLE__
+            // Hiragino Sans is the system Japanese font on every Mac since
+            // 10.11: W3 is the regular weight, W6 the bold, both single-face
+            // collections at these fixed paths (the file names are Japanese,
+            // stored here as UTF-8). No italic faces exist, so the italic
+            // slots point at the upright faces; SubtitleFont() degrades the
+            // rest. Hiragino Sans GB (Simplified Chinese, covers kana too)
+            // and AppleGothic (Korean) follow as fallbacks.
+            {{ { "/System/Library/Fonts/\xe3\x83\x92\xe3\x83\xa9\xe3\x82\xae\xe3\x83\x8e\xe8\xa7\x92\xe3\x82\xb4\xe3\x82\xb7\xe3\x83\x83\xe3\x82\xaf W3.ttc", 0 },
+               { "/System/Library/Fonts/\xe3\x83\x92\xe3\x83\xa9\xe3\x82\xae\xe3\x83\x8e\xe8\xa7\x92\xe3\x82\xb4\xe3\x82\xb7\xe3\x83\x83\xe3\x82\xaf W6.ttc", 0 },
+               { "/System/Library/Fonts/\xe3\x83\x92\xe3\x83\xa9\xe3\x82\xae\xe3\x83\x8e\xe8\xa7\x92\xe3\x82\xb4\xe3\x82\xb7\xe3\x83\x83\xe3\x82\xaf W3.ttc", 0 },
+               { "/System/Library/Fonts/\xe3\x83\x92\xe3\x83\xa9\xe3\x82\xae\xe3\x83\x8e\xe8\xa7\x92\xe3\x82\xb4\xe3\x82\xb7\xe3\x83\x83\xe3\x82\xaf W6.ttc", 0 } }},
+            {{ { "/System/Library/Fonts/Hiragino Sans GB.ttc", 0 },
+               { "/System/Library/Fonts/Hiragino Sans GB.ttc", 1 },
+               { "/System/Library/Fonts/Hiragino Sans GB.ttc", 0 },
+               { "/System/Library/Fonts/Hiragino Sans GB.ttc", 1 } }},
+            {{ { "/System/Library/Fonts/Supplemental/AppleGothic.ttf", 0 },
+               { "/System/Library/Fonts/Supplemental/AppleGothic.ttf", 0 },
+               { "/System/Library/Fonts/Supplemental/AppleGothic.ttf", 0 },
+               { "/System/Library/Fonts/Supplemental/AppleGothic.ttf", 0 } }},
+#else
             {{ { "C:\\Windows\\Fonts\\meiryo.ttc",  0 },
                { "C:\\Windows\\Fonts\\meiryob.ttc", 0 },
                { "C:\\Windows\\Fonts\\meiryo.ttc",  1 },
@@ -9769,6 +9853,7 @@ int main(int argc, char** argv)
                { "C:\\Windows\\Fonts\\msgothic.ttc", 0 },
                { "C:\\Windows\\Fonts\\msgothic.ttc", 0 },
                { "C:\\Windows\\Fonts\\msgothic.ttc", 0 } }},
+#endif
         };
 
         for (const SubtitleFamily& family : kFamilies)

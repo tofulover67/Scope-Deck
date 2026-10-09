@@ -9,6 +9,13 @@
 #include <vector>
 #include <string>
 
+#ifndef _WIN32
+#include "PosixProcess.h"
+#endif
+#ifdef __APPLE__
+#include "mac/MacPlatform.h"
+#endif
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -333,20 +340,37 @@ static bool JsonBoolField(const std::string& p_Line, const char* p_Key)
     return p_Line.compare(i, 4, "true") == 0;
 }
 
+#ifndef _WIN32
+// The worker script ships inside the app: Contents/Resources on macOS (next
+// to the binary for a bare build) - the same "resolve it from the executable,
+// never from the inherited working directory" rule as WorkerScriptPath above.
+static std::string PosixWorkerScriptPath()
+{
+#ifdef __APPLE__
+    return mac::ResourcePath("timecode_poll_worker.py");
+#else
+    return "timecode_poll_worker.py";
+#endif
+}
+#endif
+
 static void TimecodePollThread()
 {
-#ifdef _WIN32
     // Resolved once for the life of the thread rather than re-probed every
     // poll - it is a fixed fact about this machine's install, and re-running
     // "py --version" etc. every 2 seconds forever would just be four wasted
     // process spawns a cycle once the answer is already known.
+#ifdef _WIN32
     const std::string launcher = ResolvePythonLauncher();
+#else
+    const std::string launcher = FindPythonLauncher();
+    PosixWorker worker;
+#endif
     {
         std::lock_guard<std::mutex> lock(g_TcMutex);
         g_TcInfo.pythonChecked = true;
         g_TcInfo.pythonFound   = !launcher.empty();
     }
-#endif
 
     while (!g_TcQuit)
     {
@@ -356,10 +380,8 @@ static void TimecodePollThread()
             needsPoll = g_TcInfo.active;
         }
 
-#ifdef _WIN32
         if (needsPoll && launcher.empty())
             needsPoll = false;   // nothing to run - see pythonFound above
-#endif
 
         if (needsPoll)
         {
@@ -423,39 +445,48 @@ static void TimecodePollThread()
                 }
             }
 #else
-            // Non-Windows still spawns one-shot per poll (see MAC_PORTING.md -
-            // unconfirmed on this platform); no persistent-worker plumbing
-            // here yet, so this keeps the pre-existing before/after-sample
-            // behavior rather than the drift-rejecting one above.
-            const double timelineTimeAtPoll = g_CurrentTimelineTime.load(std::memory_order_relaxed);
+            // The same persistent worker and before/after sample match as the
+            // Windows branch above, over posix_spawn and pipes
+            // (PosixProcess.h) instead of CreateProcess. Kept as a parallel
+            // branch rather than merged: the Windows plumbing is the tested
+            // one and this keeps its bytes untouched.
+            if (!worker.IsRunning())
+                worker.Start({ launcher, PosixWorkerScriptPath() }, "");
 
-            std::string result = "";
-            FILE* pipe = popen("python3 timecode_poll_worker.py --once", "r");
-            if (pipe) {
-                char buffer[256];
-                while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                    result += buffer;
-                }
-                pclose(pipe);
-            }
+            if (worker.IsRunning())
+            {
+                const double timelineTimeBefore = g_CurrentTimelineTime.load(std::memory_order_relaxed);
 
-            if (!result.empty() && result.find("\"fps\":") != std::string::npos) {
-                size_t fpsPos = result.find("\"fps\":");
-                int fps = std::stoi(result.substr(fpsPos + 6));
+                std::string result;
+                bool ok = worker.WriteLine("poll\n");
+                if (ok)
+                    ok = worker.ReadLine(result, 750, &g_TcQuit);
 
-                const bool drop_frame = JsonBoolField(result, "\"drop_frame\":");
+                if (!ok) {
+                    worker.Stop();   // died, hung or the pipe broke - relaunched next cycle
+                } else {
+                    const double timelineTimeAfter = g_CurrentTimelineTime.load(std::memory_order_relaxed);
+                    const bool stableSample = std::llround(timelineTimeBefore) == std::llround(timelineTimeAfter);
 
-                size_t framePos = result.find("\"frame\":");
-                const bool haveFrame = framePos != std::string::npos;
-                const long long workerFrame = haveFrame
-                    ? std::stoll(result.substr(framePos + 8)) : 0;
+                    if (stableSample && result.find("\"fps\":") != std::string::npos) {
+                        size_t fpsPos = result.find("\"fps\":");
+                        int fps = std::stoi(result.substr(fpsPos + 6));
 
-                std::lock_guard<std::mutex> lock(g_TcMutex);
-                g_TcInfo.fps = fps;
-                g_TcInfo.dropFrame = drop_frame;
-                if (haveFrame) {
-                    g_TcInfo.frameOffset = workerFrame - std::llround(timelineTimeAtPoll);
-                    g_TcInfo.haveOffset  = true;
+                        const bool drop_frame = JsonBoolField(result, "\"drop_frame\":");
+
+                        size_t framePos = result.find("\"frame\":");
+                        const bool haveFrame = framePos != std::string::npos;
+                        const long long workerFrame = haveFrame
+                            ? std::stoll(result.substr(framePos + 8)) : 0;
+
+                        std::lock_guard<std::mutex> lock(g_TcMutex);
+                        g_TcInfo.fps = fps;
+                        g_TcInfo.dropFrame = drop_frame;
+                        if (haveFrame) {
+                            g_TcInfo.frameOffset = workerFrame - std::llround(timelineTimeAfter);
+                            g_TcInfo.haveOffset  = true;
+                        }
+                    }
                 }
             }
 #endif
@@ -468,6 +499,8 @@ static void TimecodePollThread()
 
 #ifdef _WIN32
     StopPersistentWorker();
+#else
+    worker.Stop();
 #endif
 }
 

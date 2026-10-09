@@ -22,6 +22,8 @@
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3.h>
 #include <GLFW/glfw3native.h>
+#elif defined(__APPLE__)
+#include "mac/MacPlatform.h"
 #endif
 
 namespace scopedeck
@@ -119,6 +121,13 @@ std::string OpenStillFileDialog()
     // std::string should not carry that as part of its own contents.
     if (!utf8.empty() && utf8.back() == '\0') utf8.pop_back();
     return utf8;
+}
+#elif defined(__APPLE__)
+std::string OpenStillFileDialog()
+{
+    // NSOpenPanel, filtered to image types - already UTF-8, which is what
+    // stb_image's fopen wants on this platform. See MacPlatform.mm.
+    return mac::OpenImageFileDialog("Load Still");
 }
 #else
 std::string OpenStillFileDialog()

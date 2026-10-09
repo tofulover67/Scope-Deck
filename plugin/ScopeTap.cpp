@@ -38,6 +38,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <csignal>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -324,34 +325,47 @@ void ScopeTapPlugin::changedParam(const OFX::InstanceChangedArgs& /*p_Args*/,
             m_InstanceId, appPath.c_str(), GetLastError());
     }
 #else
-    // Unverified: the new C++ app has only been built and run on Windows so
-    // far (see MAC_PORTING.md) - this mirrors the Windows logic as best as
-    // can be done without a macOS build to check it against.
-    if (appPath.empty())
-    {
-        const char* home = std::getenv("HOME");
-        if (home)
-            appPath = std::string(home) + "/Library/Application Support/ScopeDeck/scopedeck";
-    }
+    // macOS: through LaunchServices (/usr/bin/open), the way a Dock click
+    // launches an app. By bundle id, not path, so it finds Scope Deck.app
+    // wherever the installer or the user put it, brings the existing instance
+    // forward instead of starting a second one, and never leaves us a child
+    // to reap - open returns once the launch is handed off. SCOPE_DECK_APP may
+    // name a .app (opened the same way) or a bare executable from a dev build
+    // (run directly).
+    std::vector<std::string> argv;
+    if (!appPath.empty() && appPath.size() > 4 &&
+        appPath.compare(appPath.size() - 4, 4, ".app") == 0)
+        argv = { "/usr/bin/open", "-a", appPath };
+    else if (!appPath.empty())
+        argv = { appPath };
+    else
+        argv = { "/usr/bin/open", "-b", "com.scopedeck.app" };
 
-    // Double-fork so the app is reparented to init instead of becoming our
-    // zombie, without ever handing appPath to a shell. No interpreter
-    // needed - execv the resolved binary directly.
-    pid_t pid = fork();
-    if (pid == 0)
+    std::vector<char*> cargv;
+    for (std::string& a : argv) cargv.push_back(&a[0]);
+    cargv.push_back(nullptr);
+
+    pid_t pid = -1;
+    const int rc = posix_spawn(&pid, cargv[0], nullptr, nullptr, cargv.data(), environ);
+    if (rc != 0)
     {
-        const char* argv[] = { appPath.c_str(), nullptr };
-        pid_t grandchild = -1;
-        posix_spawn(&grandchild, appPath.c_str(), nullptr, nullptr, const_cast<char* const*>(argv), environ);
-        _exit(0);
+        Log("inst=%u  Failed to launch Scope Deck app (%s), error=%d", m_InstanceId, cargv[0], rc);
     }
-    else if (pid > 0)
+    else if (argv[0] == "/usr/bin/open")
     {
-        waitpid(pid, nullptr, 0);
+        // open exits as soon as LaunchServices has the request; a non-zero
+        // status means no app with that bundle id is installed.
+        int status = 0;
+        waitpid(pid, &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            Log("inst=%u  open could not launch Scope Deck (exit %d) - is Scope Deck.app installed?",
+                m_InstanceId, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     }
     else
     {
-        Log("inst=%u  Failed to fork for Scope Deck app launch", m_InstanceId);
+        // A directly spawned dev binary: reap it later, not now - it is the
+        // app itself and runs as long as the user wants.
+        signal(SIGCHLD, SIG_IGN);
     }
 #endif
 }

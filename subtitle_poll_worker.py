@@ -70,7 +70,8 @@ import time
 
 def _bootstrap_resolve_env():
     if sys.platform == "darwin":
-        # Unconfirmed - see MAC_PORTING.md.
+        # Resolve's own documented locations (Developer/Scripting/README.txt);
+        # fusionscript.so lives inside the app bundle.
         if "RESOLVE_SCRIPT_API" not in os.environ:
             os.environ["RESOLVE_SCRIPT_API"] = (
                 "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting"
@@ -325,11 +326,9 @@ def main() -> None:
         _emit({"error": "bootstrap"})
         sys.exit(1)
 
-    # --once: answer a single poll and exit, matching the old fire-and-forget
-    # subprocess-per-poll behavior - kept for the non-Windows caller in
-    # SubtitleBridge.cpp, which has no persistent-worker plumbing yet (see
-    # MAC_PORTING.md) and would otherwise leave this loop reading a stdin
-    # that's never going to close.
+    # --once: answer a single poll and exit. No bridge uses it any more (both
+    # platforms keep a persistent worker, below); it stays for checking the
+    # Resolve connection by hand from a terminal.
     if "--once" in sys.argv:
         try:
             _emit(_poll_once(dvr_script))
@@ -337,7 +336,7 @@ def main() -> None:
             _emit(_fail("exception"))
         return
 
-    # Persistent mode (Windows): one request per stdin line, answered one at
+    # Persistent mode: one request per stdin line, answered one at
     # a time - the parent always waits for a response before sending the
     # next, so there is no need to tag requests/responses.
     for line in sys.stdin:

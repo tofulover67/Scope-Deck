@@ -56,10 +56,10 @@ bool LoadStillFromFile(const char* p_Path, StillImage& p_Out);
 
 // A native "Open" dialog restricted to common image types. Returns the
 // chosen path (UTF-8), or an empty string if the user cancelled or the
-// dialog failed. Windows-only for now, matching TimecodeBridge's own
-// #ifdef _WIN32 scoping - there is no portable file-dialog dependency in
-// this tree yet, and the Compare panel's "Load Still..." button simply does
-// nothing on a platform this returns "" on unconditionally.
+// dialog failed. GetOpenFileName on Windows, NSOpenPanel on macOS (see
+// mac/MacPlatform.mm) - there is no portable file-dialog dependency in this
+// tree, and on any other platform the Compare panel's "Load Still..." button
+// simply does nothing because this returns "" unconditionally.
 std::string OpenStillFileDialog();
 
 } // namespace scopedeck

@@ -17,6 +17,18 @@ if(APPLE)
     enable_language(OBJCXX)
 endif()
 
+if(NOT MSVC)
+    # Clang contracts a*b+c into a fused multiply-add by default on arm64 (GCC
+    # does the same under -ffp-contract=fast); MSVC does not under /fp:precise.
+    # Every reduction backend has to agree bit-for-bit with the reference in
+    # scope_conformance - and the Mac CPU path with the Windows one - so
+    # contraction is off for the whole tree, not only for the harness. Found on
+    # the first Apple Silicon build: 160 conformance cases off by one ULP in
+    # the waveform trace, engine against reference, with only the harness
+    # compiled -ffp-contract=off.
+    add_compile_options(-ffp-contract=off)
+endif()
+
 # What the macOS bundle reports as its version. release_mac.sh passes the one
 # from VERSION; a plain dev build is stamped with the project's own.
 set(SCOPEDECK_VERSION "${PROJECT_VERSION}" CACHE STRING "Version stamped into the macOS app bundle")
@@ -105,6 +117,13 @@ add_executable(scopedeck
     # Preview Scale / Row Step handed to the Premiere plugin (Input menu).
     core/ScopeControl.cpp
 )
+
+if(NOT WIN32)
+    # The posix_spawn/pipe plumbing both Python bridges use for their
+    # persistent worker on macOS (and Linux); Windows keeps its CreateProcess
+    # code inline in each bridge.
+    target_sources(scopedeck PRIVATE app/PosixProcess.cpp app/PosixProcess.h)
+endif()
 
 target_include_directories(scopedeck PRIVATE app)
 target_link_libraries(scopedeck PRIVATE scopecore imgui stb_image)
