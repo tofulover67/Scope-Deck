@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 

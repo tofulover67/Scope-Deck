@@ -38,7 +38,6 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <csignal>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -328,16 +327,17 @@ void ScopeTapPlugin::changedParam(const OFX::InstanceChangedArgs& /*p_Args*/,
     // macOS: through LaunchServices (/usr/bin/open), the way a Dock click
     // launches an app. By bundle id, not path, so it finds Scope Deck.app
     // wherever the installer or the user put it, brings the existing instance
-    // forward instead of starting a second one, and never leaves us a child
-    // to reap - open returns once the launch is handed off. SCOPE_DECK_APP may
-    // name a .app (opened the same way) or a bare executable from a dev build
-    // (run directly).
+    // forward instead of starting a second one, and never leaves this process
+    // a child to reap - open returns once the launch is handed off, and a
+    // plugin inside Resolve must not touch SIGCHLD or fork tricks that would
+    // interfere with the host's own children. SCOPE_DECK_APP may name a .app
+    // or a bare executable from a dev build; open runs either.
     std::vector<std::string> argv;
     if (!appPath.empty() && appPath.size() > 4 &&
         appPath.compare(appPath.size() - 4, 4, ".app") == 0)
         argv = { "/usr/bin/open", "-a", appPath };
     else if (!appPath.empty())
-        argv = { appPath };
+        argv = { "/usr/bin/open", appPath };
     else
         argv = { "/usr/bin/open", "-b", "com.scopedeck.app" };
 
@@ -349,23 +349,17 @@ void ScopeTapPlugin::changedParam(const OFX::InstanceChangedArgs& /*p_Args*/,
     const int rc = posix_spawn(&pid, cargv[0], nullptr, nullptr, cargv.data(), environ);
     if (rc != 0)
     {
-        Log("inst=%u  Failed to launch Scope Deck app (%s), error=%d", m_InstanceId, cargv[0], rc);
+        Log("inst=%u  Failed to run %s, error=%d", m_InstanceId, cargv[0], rc);
     }
-    else if (argv[0] == "/usr/bin/open")
+    else
     {
         // open exits as soon as LaunchServices has the request; a non-zero
-        // status means no app with that bundle id is installed.
+        // status means nothing with that bundle id (or at that path) exists.
         int status = 0;
         waitpid(pid, &status, 0);
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
             Log("inst=%u  open could not launch Scope Deck (exit %d) - is Scope Deck.app installed?",
                 m_InstanceId, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-    }
-    else
-    {
-        // A directly spawned dev binary: reap it later, not now - it is the
-        // app itself and runs as long as the user wants.
-        signal(SIGCHLD, SIG_IGN);
     }
 #endif
 }
