@@ -6411,6 +6411,54 @@ void DrawAudioMeterPanel(App& p_App, Panel& p_Panel)
 void AudioStatusMessage(const AudioMeterLevels& p_Levels, char* p_Buf, size_t p_BufSize)
 {
     const char* host = p_Levels.hostName ? p_Levels.hostName : "the host";
+#ifdef __APPLE__
+    // macOS: lastHresult is an OSStatus, and Core Audio's are mostly
+    // four-character codes ('!obj', 'nope') - shown as such, since that is
+    // the form Apple's headers and every forum thread about them use.
+    char code[24];
+    {
+        const uint32_t v = static_cast<uint32_t>(p_Levels.lastHresult);
+        const char c[4] = { char(v >> 24), char(v >> 16), char(v >> 8), char(v) };
+        bool printable = true;
+        for (char ch : c) printable = printable && ch >= 0x20 && ch < 0x7F;
+        if (printable)
+            std::snprintf(code, sizeof(code), "'%c%c%c%c'", c[0], c[1], c[2], c[3]);
+        else
+            std::snprintf(code, sizeof(code), "%ld", p_Levels.lastHresult);
+    }
+    switch (p_Levels.status)
+    {
+        case AudioMeterStatus::ResolveNotFound:
+            std::snprintf(p_Buf, p_BufSize, "%s isn't running.", host);
+            break;
+        case AudioMeterStatus::ActivationCallFailed:
+            std::snprintf(p_Buf, p_BufSize, "Couldn't tap %s's audio (%s).", host, code);
+            break;
+        case AudioMeterStatus::ActivationTimedOut:   // Windows only - never set on macOS
+            std::snprintf(p_Buf, p_BufSize, "Timed out waiting to tap %s's audio.", host);
+            break;
+        case AudioMeterStatus::ActivationResultFailed:
+            std::snprintf(p_Buf, p_BufSize, "Couldn't set up capture of %s's audio (%s).", host, code);
+            break;
+        case AudioMeterStatus::StreamInitFailed:
+            std::snprintf(p_Buf, p_BufSize, "%s's audio stream failed to start (%s).", host, code);
+            break;
+        case AudioMeterStatus::PermissionDenied:
+            // Three short lines: the panels can be narrow, and this one has
+            // to be read in full to be any use.
+            std::snprintf(p_Buf, p_BufSize, "Audio recording is off for Scope Deck. Allow it in\n"
+                                            "System Settings > Privacy & Security >\n"
+                                            "Screen & System Audio Recording.");
+            break;
+        case AudioMeterStatus::HostHasNoAudio:
+            std::snprintf(p_Buf, p_BufSize, "%s hasn't opened any audio yet.", host);
+            break;
+        case AudioMeterStatus::Capturing:
+        default:
+            std::snprintf(p_Buf, p_BufSize, "Tapped into %s - waiting for audio.", host);
+            break;
+    }
+#else
     const unsigned long hr = static_cast<unsigned long>(p_Levels.lastHresult);
     switch (p_Levels.status)
     {
@@ -6434,6 +6482,7 @@ void AudioStatusMessage(const AudioMeterLevels& p_Levels, char* p_Buf, size_t p_
             std::snprintf(p_Buf, p_BufSize, "Tapped into %s - waiting for audio.", host);
             break;
     }
+#endif
 }
 
 // ---------------------------------------------------------------------------
