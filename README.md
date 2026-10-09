@@ -26,8 +26,9 @@ the Color page and open Scope Deck.
 **One display on a Mac?** Keep part of Resolve's viewer visible beside Scope
 Deck. When Resolve's window is completely covered, macOS puts it to sleep
 (App Nap) and its playback runs fast with no sound. Scope Deck opens at three
-quarters of the screen for this reason and remembers where you put it. To
-turn App Nap off for Resolve altogether, run this once and restart Resolve:
+quarters of the screen for this reason and remembers where you put it. The
+installer also turns App Nap off for Resolve (it takes effect when Resolve
+next starts); if you installed by hand, this is the command:
 
 ```bash
 defaults write com.blackmagic-design.DaVinciResolve NSAppSleepDisabled -bool YES

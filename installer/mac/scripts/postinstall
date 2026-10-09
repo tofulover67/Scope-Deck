@@ -62,5 +62,25 @@ fi
 # bundle is readable and executable by everyone, as a drag-installed app is.
 chmod -R a+rX "/Applications/Scope Deck.app" "/Library/OFX/Plugins/ScopeTap.ofx.bundle" 2>/dev/null || true
 
+# ------------------------------------------------------------ Resolve App Nap
+
+# When DaVinci Resolve's window is completely covered - easy on a one-display
+# Mac with the scopes in front - macOS puts Resolve to sleep (App Nap) and its
+# playback free-runs with no sound until part of its window shows again.
+# NSAppSleepDisabled is Apple's per-app opt-out, the same setting Activity
+# Monitor's old "Prevent App Nap" checkbox wrote. Set for the person at the
+# Mac, in their own preferences, as they would from Terminal; Resolve picks it
+# up on its next start. Confirmed to cure the symptom on Resolve 21.
+USER_NAME="$(stat -f%Su /dev/console)"
+if [ -n "$USER_NAME" ] && [ "$USER_NAME" != "root" ] && [ "$USER_NAME" != "loginwindow" ]; then
+    if sudo -u "$USER_NAME" defaults write com.blackmagic-design.DaVinciResolve NSAppSleepDisabled -bool YES; then
+        echo "App Nap disabled for DaVinci Resolve ($USER_NAME)"
+    else
+        echo "Could not write Resolve's App Nap preference for $USER_NAME (not fatal)"
+    fi
+else
+    echo "No console user found - Resolve's App Nap preference left alone"
+fi
+
 echo "=== Done"
 exit 0
