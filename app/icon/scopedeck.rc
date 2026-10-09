@@ -1,0 +1,8 @@
+// The resource name is not arbitrary: GLFW's Win32 backend loads an icon called
+// GLFW_ICON from the executable when it registers its window class
+// (vendor/glfw/src/win32_window.c), so every GLFW window - the main one and each
+// ImGui viewport torn off into its own window - gets this icon with no runtime
+// code. Being the exe's only icon group, it is also what Explorer shows.
+//
+// Regenerate scopedeck.ico from scopedeck_icon.png with tools/make_icon.py.
+GLFW_ICON ICON "scopedeck.ico"

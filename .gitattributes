@@ -1,0 +1,9 @@
+# Store and check out every file byte-for-byte, with no line-ending conversion.
+#
+# This tree's line endings are mixed on purpose-as-found: ScopeTypes.h is LF,
+# ScopeReader.cpp is CRLF, and some files are mixed internally (see
+# GPU_PORT_HANDOFF.md section 6). Git's default autocrlf on Windows would
+# rewrite them on checkout, which would both churn the whole tree and change
+# the bytes that scripted edits match against. A repository that exists to be
+# a safety net must not edit the files it is protecting.
+* -text

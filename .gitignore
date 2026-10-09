@@ -1,0 +1,27 @@
+# Build outputs. Every one is a CMake binary dir whose cache carries absolute
+# toolchain paths from whichever machine configured it - they do not survive
+# being copied to another machine and must never be committed.
+build/
+build-cuda/
+build-release/
+build-mac/
+build-mac-release/
+
+# Installer output from release.ps1 / release_mac.sh.
+dist/
+
+# Adobe's Premiere Pro SDK, downloaded per machine from the Adobe Developer
+# Console. Not committed: its licence is Adobe's, not BSD like vendor/openfx.
+adobe premiere sdk/
+
+# Python bytecode from the timecode/subtitle poll workers.
+__pycache__/
+
+# Stray object file from a one-off stb compile check.
+test_stb.obj
+
+# Runtime debug logs written next to the app.
+*.log
+
+# macOS Finder metadata.
+.DS_Store
