@@ -1,0 +1,168 @@
+# Builds the Windows and macOS installers and publishes them as one GitHub
+# release. Runs when VERSION (or this file) changes on main, and by hand
+# (Actions > Release > Run workflow); a version that is already released is
+# skipped, so bump VERSION to release again.
+#
+#   Windows: release.ps1  -> ScopeDeck-Setup-<version>.exe (needs CUDA 12.9 and
+#                            Inno Setup, both installed on the runner here)
+#   macOS:   release_mac.sh -> ScopeDeck-<version>.pkg (universal; unsigned)
+#
+# Each is the same script a local rehearsal runs. A hand-triggered run on a
+# version that already has a release builds both and keeps them under the
+# run's Artifacts without publishing anything.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - VERSION
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write   # creating the release
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.exists.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read VERSION
+        id: version
+        run: |
+          v="$(tr -d '[:space:]' < VERSION)"
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "VERSION must look like 1.2.3 (got '$v')"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Version $v"
+
+      - name: Is this version already released?
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.version.outputs.version }}" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "v${{ steps.version.outputs.version }} already exists - building only; bump VERSION to release again."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows:
+    needs: version
+    # windows-2022, not windows-latest: it carries VS 2022 (MSVC 14.44), the
+    # newest toolset CUDA 12.9's nvcc accepts.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The compiler and runtime only, not the whole ~3 GB toolkit. 12.9.0 is
+      # the version the shipping plugin is built and conformance-tested with.
+      - name: Install CUDA 12.9
+        shell: pwsh
+        run: |
+          $url = 'https://developer.download.nvidia.com/compute/cuda/12.9.0/network_installers/cuda_12.9.0_windows_network.exe'
+          Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP\cuda.exe"
+          $p = Start-Process "$env:RUNNER_TEMP\cuda.exe" -ArgumentList '-s', 'nvcc_12.9', 'cudart_12.9' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "CUDA installer exited with $($p.ExitCode)" }
+          $cuda = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+          if (-not (Test-Path "$cuda\bin\nvcc.exe")) { throw "nvcc.exe missing after install" }
+          "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build, test and package
+        shell: pwsh
+        run: ./release.ps1 -Version "${{ needs.version.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScopeDeck-Setup-windows
+          path: dist/*.exe
+          if-no-files-found: error
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Build, test and package
+        run: ./release_mac.sh --version "${{ needs.version.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScopeDeck-macos
+          path: dist/*.pkg
+          if-no-files-found: error
+
+  publish:
+    needs: [version, windows, macos]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ needs.version.outputs.version }}"
+          exe="$(ls artifacts/*.exe)"
+          pkg="$(ls artifacts/*.pkg)"
+          sha_exe="$(sha256sum "$exe" | cut -d ' ' -f 1)"
+          sha_pkg="$(sha256sum "$pkg" | cut -d ' ' -f 1)"
+          cat > notes.md <<EOF_NOTES
+          ## Windows
+
+          Quit DaVinci Resolve and Premiere Pro, run \`$(basename "$exe")\`, then:
+          - **Resolve:** add **Scope Tap** (OpenFX, Scope Deck group) to a node.
+          - **Premiere Pro:** tick **Scope Deck** under Preferences → Playback → Video Device.
+          - In Scope Deck, choose the host under **Input**.
+
+          Installs the Scope Deck app, the Scope Tap plugin for Resolve (into \`C:\Program Files\Common Files\OFX\Plugins\`) and, when Premiere Pro is installed, the Scope Deck plugin for Premiere. It asks for admin once. NVIDIA cards use the GPU path; AMD and Intel cards fall back to the CPU path automatically. Includes its own Python for the timecode and subtitle panels. The installer is not code-signed, so SmartScreen may warn: click **More info**, then **Run anyway**.
+
+          SHA-256 of $(basename "$exe"): \`$sha_exe\`
+
+          ## macOS
+
+          Quit DaVinci Resolve, open \`$(basename "$pkg")\`, then start Resolve and add **Scope Tap** (OpenFX, Scope Deck group) to a node. Scope Deck itself is in Applications; the plugin's **Open Scope Deck** button launches it too.
+
+          Installs Scope Deck.app and the Scope Tap plugin (into \`/Library/OFX/Plugins\`); universal, Apple silicon and Intel. The Resolve tap runs its CPU path on macOS. If the Mac has no python.org Python yet, one is installed for the timecode and subtitle panels. The Audio Meter asks once for permission to capture system audio, and Screen Capture needs Screen Recording - both under System Settings → Privacy & Security.
+
+          The installer is not signed, so macOS blocks it the first time: open System Settings → Privacy & Security and click **Open Anyway**. Only ever download it from this page.
+
+          SHA-256 of $(basename "$pkg"): \`$sha_pkg\`
+          EOF_NOTES
+          gh release create "v$v" "$exe" "$pkg" \
+            --repo "$GITHUB_REPOSITORY" --title "Scope Deck $v" \
+            --notes-file notes.md --generate-notes --target "$GITHUB_SHA"

@@ -1,0 +1,66 @@
+#!/bin/bash
+# Scope Deck's macOS installer: runs as root once the user clicks Install
+# (release_mac.sh puts it in the .pkg). The payload - Scope Deck.app into
+# /Applications and ScopeTap.ofx.bundle into /Library/OFX/Plugins - has
+# already landed by the time this runs; this script only sees to the Python
+# the Timecode and Subtitle panels need:
+#
+#   The two bridges run timecode_poll_worker.py / subtitle_poll_worker.py
+#   with python.org's Python from /Library/Frameworks (see
+#   app/PosixProcess.cpp's FindPythonLauncher). A Mac without one gets it
+#   installed here - python.org's own installer, pinned by SHA-256 - and a
+#   Mac that already has 3.10 or newer is left alone. Only the standard
+#   library is used, plus Resolve's own scripting module, so no packages.
+#
+# Everything is logged to /Library/Logs/ScopeDeck-install.log. A failure
+# exits non-zero, which the installer shows as "The installation failed".
+
+set -u
+
+LOG=/Library/Logs/ScopeDeck-install.log
+exec >>"$LOG" 2>&1
+echo "=== Scope Deck install, $(date)"
+
+fail() {
+    echo "FAILED: $1"
+    exit 1
+}
+
+# Pinned by its SHA-256 from python.org's release page, so a tampered download
+# is refused. Change both together.
+PY_VERSION="3.13.15"
+PY_URL="https://www.python.org/ftp/python/${PY_VERSION}/python-${PY_VERSION}-macos11.pkg"
+PY_SHA256="3b7eaf7f29825f796e8267024435540ddf1f17fc9a97ad58095daa7a75bfdcd3"
+
+find_pythons() {
+    for dir in /Library/Frameworks/Python.framework/Versions/3.*; do
+        minor="${dir##*/3.}"
+        case "$minor" in ''|*[!0-9]*) continue ;; esac
+        if [ "$minor" -ge 10 ] && [ -x "$dir/bin/python3" ]; then
+            echo "$dir/bin/python3"
+        fi
+    done
+}
+
+PYTHONS="$(find_pythons)"
+if [ -z "$PYTHONS" ]; then
+    echo "No Python 3.10+ from python.org - installing Python $PY_VERSION"
+    WORK="$(mktemp -d)"
+    trap 'rm -rf "$WORK"' EXIT
+    curl -fL --retry 3 -o "$WORK/python.pkg" "$PY_URL" || fail "couldn't download $PY_URL (no internet connection?)"
+    GOT="$(shasum -a 256 "$WORK/python.pkg" | awk '{print $1}')"
+    [ "$GOT" = "$PY_SHA256" ] || fail "Python download's checksum is wrong (got $GOT) - not installing it"
+    installer -pkg "$WORK/python.pkg" -target / || fail "Python's own installer failed"
+    PYTHONS="$(find_pythons)"
+    [ -n "$PYTHONS" ] || fail "Python installed, but no Python 3.10+ found afterwards"
+else
+    echo "Python already present:"
+    echo "$PYTHONS"
+fi
+
+# The app and plugin were written by the installer as root; make sure the
+# bundle is readable and executable by everyone, as a drag-installed app is.
+chmod -R a+rX "/Applications/Scope Deck.app" "/Library/OFX/Plugins/ScopeTap.ofx.bundle" 2>/dev/null || true
+
+echo "=== Done"
+exit 0
