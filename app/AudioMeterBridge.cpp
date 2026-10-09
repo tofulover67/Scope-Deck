@@ -82,10 +82,10 @@ static void PublishLevels(const AudioMeterLevels& p_Levels)
 // captured packet, silent or not (a silent packet still advances time, and
 // writing real zeros for it is what keeps the Goniometer/Spectrum Analyzer
 // from reading stale, no-longer-current samples as if they were live).
-static void AppendRingSamples(const float* p_Interleaved, UINT32 p_Frames)
+static void AppendRingSamples(const float* p_Interleaved, uint32_t p_Frames)
 {
     std::lock_guard<std::mutex> lock(g_AmMutex);
-    for (UINT32 f = 0; f < p_Frames; ++f)
+    for (uint32_t f = 0; f < p_Frames; ++f)
     {
         const uint64_t dst = (g_AmRing.writeCount + f) % uint64_t(AudioRingSnapshot::kCapacity);
         for (int c = 0; c < AudioRingSnapshot::kChannels; ++c)

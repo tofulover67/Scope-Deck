@@ -458,13 +458,13 @@ static void SubtitlePollThread()
 #else
             // Non-Windows still spawns one-shot per poll, same as
             // TimecodeBridge's own non-Windows path (see MAC_PORTING.md).
-            FILE* pipe = _popen("python3 subtitle_poll_worker.py --once", "r");
+            FILE* pipe = popen("python3 subtitle_poll_worker.py --once", "r");
             if (pipe) {
                 char buffer[4096];
                 while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
                     result += buffer;
                 }
-                _pclose(pipe);
+                pclose(pipe);
             }
 #endif
             // A failure line ({"error": ...}) clears the cues outright -

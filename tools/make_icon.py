@@ -1,7 +1,8 @@
-"""Rebuild app/icon/scopedeck.ico from app/icon/scopedeck_icon.png.
+"""Rebuild app/icon/scopedeck.ico and app/icon/scopedeck.icns from
+app/icon/scopedeck_icon.png.
 
-Dev-time only: the .ico is committed, so building the app never runs this or
-needs Python. Re-run it by hand after replacing the source PNG:
+Dev-time only: both icons are committed, so building the app never runs this
+or needs Python. Re-run it by hand after replacing the source PNG:
 
     python tools/make_icon.py
 
@@ -19,6 +20,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "app" / "icon" / "scopedeck_icon.png"
 TARGET = ROOT / "app" / "icon" / "scopedeck.ico"
+TARGET_ICNS = ROOT / "app" / "icon" / "scopedeck.icns"
 
 # Windows picks the nearest size per context: 16/20/24 title bar and small
 # lists, 32/40/48 taskbar and Alt-Tab across 100-200% scaling, 256 Explorer.
@@ -40,6 +42,11 @@ def main() -> None:
     frames[-1].save(TARGET, format="ICO", sizes=[(s, s) for s in SIZES],
                     append_images=frames[:-1])
     print(f"wrote {TARGET} ({', '.join(str(s) for s in SIZES)})")
+
+    # macOS: Pillow's ICNS writer stores every size the Finder and Dock ask
+    # for (16 to 1024, with the @2x variants) from the one source image.
+    source.save(TARGET_ICNS, format="ICNS")
+    print(f"wrote {TARGET_ICNS}")
 
 
 if __name__ == "__main__":

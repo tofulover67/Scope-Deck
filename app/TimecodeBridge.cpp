@@ -430,13 +430,13 @@ static void TimecodePollThread()
             const double timelineTimeAtPoll = g_CurrentTimelineTime.load(std::memory_order_relaxed);
 
             std::string result = "";
-            FILE* pipe = _popen("python3 timecode_poll_worker.py --once", "r");
+            FILE* pipe = popen("python3 timecode_poll_worker.py --once", "r");
             if (pipe) {
                 char buffer[256];
                 while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
                     result += buffer;
                 }
-                _pclose(pipe);
+                pclose(pipe);
             }
 
             if (!result.empty() && result.find("\"fps\":") != std::string::npos) {

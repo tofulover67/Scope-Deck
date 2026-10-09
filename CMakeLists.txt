@@ -1,5 +1,25 @@
 cmake_minimum_required(VERSION 3.20)
+
+if(APPLE)
+    # Before project(): the deployment target has to be in place for the very
+    # first compiler check. 14.2 is the floor for Core Audio process taps (the
+    # Audio Meter's capture of Resolve's own output - see
+    # app/mac/AudioCaptureMac.mm); DaVinci Resolve 21 itself needs macOS 15, so
+    # this costs nobody anything.
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.2" CACHE STRING "Minimum macOS version")
+endif()
+
 project(ScopeDeck VERSION 0.1.0 LANGUAGES CXX)
+
+if(APPLE)
+    # The macOS-only files (file dialog, Core Audio tap, ScreenCaptureKit) are
+    # Objective-C++ (.mm). Everything else stays plain C++ on every platform.
+    enable_language(OBJCXX)
+endif()
+
+# What the macOS bundle reports as its version. release_mac.sh passes the one
+# from VERSION; a plain dev build is stamped with the project's own.
+set(SCOPEDECK_VERSION "${PROJECT_VERSION}" CACHE STRING "Version stamped into the macOS app bundle")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -139,8 +159,57 @@ if(WIN32)
             "$<TARGET_FILE_DIR:scopedeck>/subtitle_poll_worker.py"
     )
 elseif(APPLE)
-    find_library(OPENGL_FRAMEWORK OpenGL REQUIRED)
-    target_link_libraries(scopedeck PRIVATE ${OPENGL_FRAMEWORK})
+    # The macOS half of the platform layer. Each .mm pairs with the .cpp that
+    # calls it: MacPlatform (file dialog, paths, bringing Resolve to the front)
+    # serves main.cpp, StillImage.cpp and the two Python bridges;
+    # AudioCaptureMac is AudioMeterBridge.cpp's Core Audio process tap;
+    # ScreenCaptureMac is ScreenCapture.cpp's region picker and
+    # ScreenCaptureKit stream.
+    target_sources(scopedeck PRIVATE
+        app/mac/MacPlatform.mm
+        app/mac/MacPlatform.h
+        app/mac/AudioCaptureMac.mm
+        app/mac/AudioCaptureMac.h
+        app/mac/ScreenCaptureMac.mm
+        app/mac/ScreenCaptureMac.h
+    )
+
+    # Apple deprecated OpenGL in 10.14 and has shipped it unchanged since. The
+    # app uses GL 3.3 core through GLFW exactly as on Windows; the warning on
+    # every gl* call says nothing this project can act on.
+    target_compile_definitions(scopedeck PRIVATE GL_SILENCE_DEPRECATION)
+
+    foreach(fw OpenGL Cocoa CoreAudio AudioToolbox CoreMedia CoreVideo CoreGraphics ScreenCaptureKit UniformTypeIdentifiers)
+        find_library(SCOPEDECK_FW_${fw} ${fw} REQUIRED)
+        target_link_libraries(scopedeck PRIVATE ${SCOPEDECK_FW_${fw}})
+    endforeach()
+
+    # A real .app, so Finder, the Dock and TCC's permission prompts (screen
+    # recording, system audio) all have something to attach to. The worker
+    # scripts go into Contents/Resources; the bridges look there (see
+    # MacPlatform.mm's ResourcePath) the way they look next to the .exe on
+    # Windows.
+    set(SCOPEDECK_MAC_RESOURCES
+        app/icon/scopedeck.icns
+        timecode_poll_worker.py
+        subtitle_poll_worker.py
+    )
+    set_source_files_properties(${SCOPEDECK_MAC_RESOURCES} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    target_sources(scopedeck PRIVATE ${SCOPEDECK_MAC_RESOURCES})
+
+    # CFBundleVersion takes numbers only, so 1.2.3-beta.1 becomes 1.2.3.
+    string(REGEX REPLACE "[-+].*$" "" SCOPEDECK_NUMERIC_VERSION "${SCOPEDECK_VERSION}")
+
+    set_target_properties(scopedeck PROPERTIES
+        OUTPUT_NAME "Scope Deck"
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/app/mac/Info.plist.in"
+        MACOSX_BUNDLE_BUNDLE_NAME "Scope Deck"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "com.scopedeck.app"
+        MACOSX_BUNDLE_ICON_FILE "scopedeck.icns"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${SCOPEDECK_VERSION}"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${SCOPEDECK_NUMERIC_VERSION}"
+        MACOSX_BUNDLE_COPYRIGHT "Trevor Siebe")
 else()
     find_package(OpenGL REQUIRED)
     target_link_libraries(scopedeck PRIVATE OpenGL::GL)
@@ -201,11 +270,13 @@ set_property(TARGET scopecore_writer PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 if(WIN32)
     target_compile_definitions(scopecore_writer PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
-elseif(APPLE)
-    set_target_properties(scopecore_writer PROPERTIES OSX_ARCHITECTURES "arm64;x86_64")
-else()
+elseif(NOT APPLE)
     target_link_libraries(scopecore_writer PUBLIC rt)   # shm_open
 endif()
+# On macOS no target forces its own architectures: a dev build is the host's
+# (arm64 or x86_64), and release_mac.sh passes
+# -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" so the shipped app and plugin are
+# universal from one configure, with every library matching.
 
 # Drives scopecore_writer with synthetic frames, so the reduction engine and
 # wire format can be verified without Resolve running.
@@ -337,7 +408,6 @@ else()
             WIN32 WIN64 NOMINMAX _CRT_SECURE_NO_WARNINGS)
         set(OFX_BUNDLE_ARCH_DIR "Win64")
     elseif(APPLE)
-        set_target_properties(ScopeTap PROPERTIES OSX_ARCHITECTURES "arm64;x86_64")
         set(OFX_BUNDLE_ARCH_DIR "MacOS")
     else()
         set(OFX_BUNDLE_ARCH_DIR "Linux-x86-64")
@@ -356,6 +426,17 @@ else()
                 "${OFX_BUNDLE_DIR}/Contents/${OFX_BUNDLE_ARCH_DIR}/ScopeTap.ofx"
         COMMENT "Packaging ScopeTap.ofx.bundle"
         VERBATIM)
+
+    if(APPLE)
+        # macOS bundles carry an Info.plist; Resolve reads the executable name
+        # from it. Windows and Linux hosts find the .ofx by the directory
+        # layout alone.
+        add_custom_command(TARGET ScopeTap POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/plugin/mac/ScopeTap-Info.plist"
+                    "${OFX_BUNDLE_DIR}/Contents/Info.plist"
+            VERBATIM)
+    endif()
 
     # ------------------------------------------------------------------
     # ScopeTapGpuSpike - the throwaway CUDA measurement plugin.
