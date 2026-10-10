@@ -926,12 +926,40 @@ measured 12 ms *on the render thread* at HD (`fetch=0.03 copy=1-2 bin=8`),
 so even at UHD the Metal path moves the whole cost off the thread Resolve is
 waiting on. M1 Pro/Max and later parts have 2-8x this GPU.
 
+**The ship gate: PASSED 2026-10-10, M1 MacBook Air, Resolve 21.0.4.**
+Deployed through `build_mac.sh --deploy`, a graded 1920x1080 Rec.709 timeline
+played for ~36 s with two tap instances live. From the log, bursts split on
+wall gaps > 1 s, the playback burst alone:
+
+| | |
+|---|---|
+| renders | 860 (878 in the session, every one on the GPU path) |
+| longest consecutive run | 655 frames in 27.20 s = **24.1 fps** on a 24p timeline |
+| **dropped frames** | **0** (no `t=` gap > 1) |
+| `skipped` | 0 |
+
+| per frame | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| `enqueue` (render thread) | 0.135 | 0.211 | 0.663 | 1.313 ms |
+| `total` (render thread) | **0.260** | 0.410 | 1.030 | 2.070 ms |
+| `dev` (device, async) | 7.92 | 10.46 | 13.05 | 13.62 ms |
+| of which kernels | 6.83 | 9.31 | 11.92 | 12.59 ms |
+| of which publish memcpy | 1.13 | 1.49 | 2.27 | 3.80 ms |
+
+Against the CPU tap on the same machine and the same timeline earlier that
+day - `fetch=0.03 copy=1-2 bin=8 total=12 ms` on the render thread - that is
+**~45x at the median on the thread Resolve waits on**, and the drops it was
+not quite producing at HD stay at zero. Device time is higher than the bench
+predicted for HD (7.9 ms against ~3.3 in the race test) because the GPU is now
+shared with Resolve's own rendering; it runs off the render thread, so it
+costs Resolve nothing until the GPU itself saturates, which an M1 at UHD with
+a heavy grade may well reach. Playback *looked* slow to the user; the log says
+Resolve held 24 fps, so that is the viewer, not the tap.
+
 **What remains.**
 
-1. **The in-Resolve ship gate on macOS** - deploy, play graded footage, split
-   the log into bursts and count `t=` gaps, as §5c did on Windows. Not yet
-   run at the time of writing: deploying to `/Library/OFX/Plugins` needs an
-   administrator's password.
+1. **A UHD ship gate** on an Apple GPU that can play UHD at all; this Air
+   cannot, with or without the tap.
 2. **Zero-copy publish** (point 1 above) if the worker ever becomes the
    bottleneck.
 3. **The load floor.** 3.5 ms to read 127 MB is well short of the M1's
