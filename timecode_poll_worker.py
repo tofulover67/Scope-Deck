@@ -28,9 +28,13 @@ line of JSON to stdout in response, then flushes. Runs until stdin closes
 
 Success line: {"timecode": "01:23:45:12", "fps": 24, "drop_frame": false,
 "frame": 2694}, timecode straight from Timeline.GetCurrentTimecode().
-Failure line (Resolve not running, no project, no timeline, or an
-unexpected exception - all treated identically by the caller):
-{"error": "<reason>"}.
+Failure line: {"error": "<reason>"}, where reason is one of "no_resolve"
+(scriptapp() returned None: Resolve not running, or the free edition, which
+has no scripting, or Studio with External Scripting off), "no_project",
+"no_timeline", "exception", or "bootstrap" (the scripting module would not
+import; the worker exits after saying so). The caller shows the reason in
+the Timecode panel (TimecodeBridge.cpp's ResolveScriptingMessage), so the
+words are part of the protocol.
 """
 
 import json

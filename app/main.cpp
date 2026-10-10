@@ -8151,8 +8151,23 @@ void DrawPreferences(Preferences& p_Prefs)
         ImGui::SetTooltip("Burns the current timeline's active subtitle track text\n"
                           "over the Source panel's image, approximating Resolve's own\n"
                           "subtitle render (font/styling are not reproduced). Polled\n"
-                          "from Resolve via its scripting API - needs Resolve running\n"
-                          "with a project open (the installer includes the Python it uses).");
+                          "from Resolve via its scripting API - needs Resolve Studio\n"
+                          "with External Scripting on and a project open (the free\n"
+                          "edition has no scripting; the installer provides the Python).");
+
+    // Why the overlay is empty, when the bridge knows. Before this the box
+    // sat ticked over a blank overlay on the free edition, with nothing
+    // anywhere to say that Resolve's scripting was the missing piece.
+    if (p_Prefs.showSubtitles)
+    {
+        const std::string subtitleStatus = SubtitleBridgeGetStatus();
+        if (!subtitleStatus.empty())
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            ImGui::TextWrapped("%s", subtitleStatus.c_str());
+            ImGui::PopStyleColor();
+        }
+    }
 
     // Styling is meaningless with the overlay off, and leaving it live would
     // invite adjusting controls whose effect cannot be seen.

@@ -23,4 +23,10 @@ namespace scopedeck
     // The Resolve path above and the Premiere path (which gets its rate,
     // drop-frame and start timecode from ScopeTransmit) share it.
     std::string FormatTimecode(long long p_Frame, int p_Fps, bool p_DropFrame);
+
+    // The sentence for one of the workers' failure reasons ("no_resolve",
+    // "no_project", "no_timeline", "bootstrap", "exception"). Both workers use
+    // the same words, and the Timecode panel and the Subtitles preference
+    // should say the same thing for them.
+    std::string ResolveScriptingMessage(const std::string& p_Reason);
 }

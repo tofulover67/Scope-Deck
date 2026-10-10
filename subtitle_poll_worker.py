@@ -42,7 +42,9 @@ so a relaunched worker can never leave the parent holding cues it never
 received). "start" is Timeline.GetStartFrame() - see _poll_once for why the
 parent needs it and why it is read rather than inferred.
 Failure line (Resolve not running, no project, no timeline, or an unexpected
-exception - all treated identically by the caller): {"error": "<reason>"}.
+exception): {"error": "<reason>"}. The reasons are the same words
+timecode_poll_worker.py uses, and the caller shows them under the Show
+Subtitles preference (SubtitleBridge.cpp), so they are part of the protocol.
 
 ensure_ascii=False on the way out (see _emit): the default True would escape
 every non-ASCII character to a \\uXXXX sequence, which the C++ side's own

@@ -24,4 +24,10 @@ namespace scopedeck
     // worker only supplies the cue ranges and the per-frame matching
     // happens here, against the frame stream that does advance live.
     std::string SubtitleBridgeGetText(double p_TimelineTime);
+
+    // Why the overlay is empty when the bridge knows: no Python, or the
+    // worker's last reason (the free edition has no scripting, Studio ships
+    // with it off, no project, no timeline). "" when nothing is wrong, or
+    // when nothing has been asked yet. Shown under the Show Subtitles box.
+    std::string SubtitleBridgeGetStatus();
 }

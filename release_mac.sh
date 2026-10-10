@@ -102,6 +102,11 @@ echo "Running scope_conformance_metal --hd..."
 echo "Running scope_publish_race_metal..."
 "$build_dir/scope_publish_race_metal"
 
+# The Resolve workers' failure reasons, which the app shows as sentences.
+# Mock objects, so no Resolve and a second or two.
+echo "Running resolve_worker_errors_check..."
+python3 "$root/tools/resolve_worker_errors_check.py"
+
 # Ad-hoc signed (no identity): seals the bundle's contents so a modified copy
 # fails verification, and gives TCC a signature to attach the audio and screen
 # permissions to. Not notarized - see the release notes for the one-time

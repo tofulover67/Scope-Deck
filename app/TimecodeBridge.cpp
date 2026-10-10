@@ -295,6 +295,13 @@ struct TimecodeInfo {
     bool pythonChecked = false;
     bool pythonFound   = false;
 
+    // The worker's reason from its last answer, "" when that answer was a
+    // reading. Shown in place of the dashes: on the free edition scriptapp()
+    // returns None and the worker says "no_resolve" every poll, which used to
+    // look exactly like Resolve not running - and on Studio the same happens
+    // until External Scripting is switched on in Preferences.
+    std::string lastError;
+
     // ScopeFrame::timelineTime is the OFX effect time, which counts frames
     // from 0 at the start of the timeline - not Resolve's own displayed
     // timecode, which starts from the project's Start Timecode setting
@@ -340,6 +347,20 @@ static bool JsonBoolField(const std::string& p_Line, const char* p_Key)
     return p_Line.compare(i, 4, "true") == 0;
 }
 
+// The quoted string after p_Key, or "" when the key is absent. The workers'
+// reasons are bare identifiers, so no escapes to undo.
+static std::string JsonStringField(const std::string& p_Line, const char* p_Key)
+{
+    const size_t keyPos = p_Line.find(p_Key);
+    if (keyPos == std::string::npos) return "";
+    size_t i = keyPos + std::strlen(p_Key);
+    while (i < p_Line.size() && (p_Line[i] == ' ' || p_Line[i] == '\t')) ++i;
+    if (i >= p_Line.size() || p_Line[i] != '"') return "";
+    const size_t end = p_Line.find('"', i + 1);
+    if (end == std::string::npos) return "";
+    return p_Line.substr(i + 1, end - i - 1);
+}
+
 #ifndef _WIN32
 // The worker script ships inside the app: Contents/Resources on macOS (next
 // to the binary for a bare build) - the same "resolve it from the executable,
@@ -372,6 +393,13 @@ static void TimecodePollThread()
         g_TcInfo.pythonFound   = !launcher.empty();
     }
 
+    // A worker that cannot import Resolve's scripting module (no Resolve
+    // installed, or installed somewhere else) says "bootstrap" and exits.
+    // Relaunching a fresh Python every 300 ms to hear the same thing again is
+    // pure churn, so after that answer the next attempt waits about 10 s.
+    constexpr int kBootstrapHoldCycles = 33;
+    int holdCycles = 0;
+
     while (!g_TcQuit)
     {
         bool needsPoll = false;
@@ -386,7 +414,7 @@ static void TimecodePollThread()
         if (needsPoll)
         {
 #ifdef _WIN32
-            if (!g_WorkerProcess)
+            if (!g_WorkerProcess && holdCycles == 0)
                 StartPersistentWorker(launcher);
 
             if (g_WorkerProcess)
@@ -414,6 +442,15 @@ static void TimecodePollThread()
                     // it gets relaunched on the next cycle.
                     StopPersistentWorker();
                 } else {
+                    // The worker's reason, "" on a reading - kept for
+                    // TimecodeBridgeGetText to show instead of the dashes.
+                    const std::string reason = JsonStringField(result, "\"error\":");
+                    {
+                        std::lock_guard<std::mutex> lock(g_TcMutex);
+                        g_TcInfo.lastError = reason;
+                    }
+                    if (reason == "bootstrap") holdCycles = kBootstrapHoldCycles;
+
                     const double timelineTimeAfter = g_CurrentTimelineTime.load(std::memory_order_relaxed);
                     const bool stableSample = std::llround(timelineTimeBefore) == std::llround(timelineTimeAfter);
 
@@ -450,7 +487,7 @@ static void TimecodePollThread()
             // (PosixProcess.h) instead of CreateProcess. Kept as a parallel
             // branch rather than merged: the Windows plumbing is the tested
             // one and this keeps its bytes untouched.
-            if (!worker.IsRunning())
+            if (!worker.IsRunning() && holdCycles == 0)
                 worker.Start({ launcher, PosixWorkerScriptPath() }, "");
 
             if (worker.IsRunning())
@@ -465,6 +502,15 @@ static void TimecodePollThread()
                 if (!ok) {
                     worker.Stop();   // died, hung or the pipe broke - relaunched next cycle
                 } else {
+                    // The worker's reason, "" on a reading - kept for
+                    // TimecodeBridgeGetText to show instead of the dashes.
+                    const std::string reason = JsonStringField(result, "\"error\":");
+                    {
+                        std::lock_guard<std::mutex> lock(g_TcMutex);
+                        g_TcInfo.lastError = reason;
+                    }
+                    if (reason == "bootstrap") holdCycles = kBootstrapHoldCycles;
+
                     const double timelineTimeAfter = g_CurrentTimelineTime.load(std::memory_order_relaxed);
                     const bool stableSample = std::llround(timelineTimeBefore) == std::llround(timelineTimeAfter);
 
@@ -492,6 +538,7 @@ static void TimecodePollThread()
 #endif
         }
 
+        if (holdCycles > 0) --holdCycles;
         for (int i = 0; i < 3 && !g_TcQuit; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
@@ -523,6 +570,16 @@ void TimecodeBridgeSetActive(bool p_Active)
     g_TcInfo.active = p_Active;
 }
 
+std::string ResolveScriptingMessage(const std::string& p_Reason)
+{
+    if (p_Reason == "no_resolve")
+        return "Resolve scripting unavailable (needs Resolve Studio with External Scripting on)";
+    if (p_Reason == "no_project")  return "No project open in Resolve";
+    if (p_Reason == "no_timeline") return "No timeline open in Resolve";
+    if (p_Reason == "bootstrap")   return "Resolve's scripting module not found";
+    return "Resolve scripting error (" + p_Reason + ")";
+}
+
 std::string TimecodeBridgeGetText(double p_TimelineTime)
 {
     int  fps = 0;
@@ -530,6 +587,7 @@ std::string TimecodeBridgeGetText(double p_TimelineTime)
     bool pythonChecked = false, pythonFound = false;
     long long frameOffset = 0;
     bool      haveOffset  = false;
+    std::string lastError;
     {
         std::lock_guard<std::mutex> lock(g_TcMutex);
         fps = g_TcInfo.fps;
@@ -538,6 +596,7 @@ std::string TimecodeBridgeGetText(double p_TimelineTime)
         pythonFound   = g_TcInfo.pythonFound;
         frameOffset   = g_TcInfo.frameOffset;
         haveOffset    = g_TcInfo.haveOffset;
+        lastError     = g_TcInfo.lastError;
     }
 
     // Distinguish "no Python interpreter found on this machine" from the
@@ -546,6 +605,12 @@ std::string TimecodeBridgeGetText(double p_TimelineTime)
     // separate, optional dependency the reader can actually go install.
     if (pythonChecked && !pythonFound)
         return "No Python found";
+
+    // The worker's own reason comes before any reading: a stale offset still
+    // counting up after the timeline closed would be a lie, and the free
+    // edition's missing scripting used to look exactly like Resolve not
+    // running.
+    if (!lastError.empty()) return ResolveScriptingMessage(lastError);
 
     if (fps <= 0 || !haveOffset) return "--:--:--:--";
 

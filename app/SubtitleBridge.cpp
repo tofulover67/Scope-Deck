@@ -1,4 +1,5 @@
 #include "SubtitleBridge.h"
+#include "TimecodeBridge.h"   // ResolveScriptingMessage
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -325,6 +326,20 @@ struct SubtitleCue {
     std::string text;
 };
 
+// The quoted string after p_Key, or "" when the key is absent - the same
+// helper TimecodeBridge.cpp has, for the same "error" lines.
+static std::string JsonStringField(const std::string& p_Line, const char* p_Key)
+{
+    const size_t keyPos = p_Line.find(p_Key);
+    if (keyPos == std::string::npos) return "";
+    size_t i = keyPos + std::strlen(p_Key);
+    while (i < p_Line.size() && (p_Line[i] == ' ' || p_Line[i] == '\t')) ++i;
+    if (i >= p_Line.size() || p_Line[i] != '"') return "";
+    const size_t end = p_Line.find('"', i + 1);
+    if (end == std::string::npos) return "";
+    return p_Line.substr(i + 1, end - i - 1);
+}
+
 struct SubtitleInfo {
     bool active = false;
 
@@ -333,6 +348,10 @@ struct SubtitleInfo {
     // this is worth keeping apart from an ordinary empty reading.
     bool pythonChecked = false;
     bool pythonFound   = false;
+
+    // The worker's reason from its last answer, "" when it carried cues or
+    // "nothing changed" - see TimecodeInfo::lastError.
+    std::string lastError;
 
     std::vector<SubtitleCue> cues;
 
@@ -412,6 +431,12 @@ static void SubtitlePollThread()
         g_SubInfo.pythonFound   = !launcher.empty();
     }
 
+    // See TimecodeBridge's identical hold: a worker that cannot import the
+    // scripting module exits after saying "bootstrap", and is not worth
+    // relaunching more often than about every 10 s.
+    constexpr int kBootstrapHoldCycles = 33;
+    int holdCycles = 0;
+
     while (!g_SubQuit)
     {
         bool needsPoll = false;
@@ -427,7 +452,7 @@ static void SubtitlePollThread()
         {
             std::string result;
 #ifdef _WIN32
-            if (!g_WorkerProcess)
+            if (!g_WorkerProcess && holdCycles == 0)
                 StartPersistentWorker(launcher);
 
             if (g_WorkerProcess)
@@ -479,7 +504,7 @@ static void SubtitlePollThread()
             // The Windows branch above over posix_spawn and pipes
             // (PosixProcess.h) - same worker, same minute-long read timeout
             // for the same reason, same "cues survive a dead worker" rule.
-            if (!worker.IsRunning())
+            if (!worker.IsRunning() && holdCycles == 0)
                 worker.Start({ launcher, PosixWorkerScriptPath() }, "");
 
             if (worker.IsRunning())
@@ -507,6 +532,17 @@ static void SubtitlePollThread()
             // timeline really is gone there is no picture to draw over
             // either, and the worker re-sends the full list (having
             // forgotten what it last sent) as soon as it recovers.
+            // The reason itself is kept (result is empty after a dead
+            // worker, which says nothing about Resolve), for
+            // SubtitleBridgeGetStatus to show under the preference.
+            if (!result.empty())
+            {
+                const std::string reason = JsonStringField(result, "\"error\":");
+                std::lock_guard<std::mutex> lock(g_SubMutex);
+                g_SubInfo.lastError = reason;
+                if (reason == "bootstrap") holdCycles = kBootstrapHoldCycles;
+            }
+
             if (result.find("\"error\":") == std::string::npos)
             {
                 size_t startPos = 0;
@@ -540,6 +576,7 @@ static void SubtitlePollThread()
         // never discarded - so switching the overlay back on shows the last
         // known cues immediately and the next poll corrects them if the
         // timeline moved on meanwhile.
+        if (holdCycles > 0) --holdCycles;
         for (int i = 0; i < 3 && !g_SubQuit; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
@@ -596,6 +633,14 @@ std::string SubtitleBridgeGetText(double p_TimelineTime)
         }
     }
     return text;
+}
+
+std::string SubtitleBridgeGetStatus()
+{
+    std::lock_guard<std::mutex> lock(g_SubMutex);
+    if (g_SubInfo.pythonChecked && !g_SubInfo.pythonFound) return "No Python found";
+    if (!g_SubInfo.lastError.empty()) return ResolveScriptingMessage(g_SubInfo.lastError);
+    return "";
 }
 
 } // namespace scopedeck
