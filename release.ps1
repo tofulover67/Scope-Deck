@@ -217,3 +217,28 @@ if ($numeric -notmatch '^\d+(\.\d+){0,3}$') { throw "Version '$Version' does not
 if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed.' }
 
 Write-Host "Installer: $(Join-Path $distDir "ScopeDeck-Setup-$Version.exe")" -ForegroundColor Green
+
+# --- manual-install archive -----------------------------------------------------
+
+# The same files the installer puts down, as a plain zip for anyone who would
+# rather place them by hand - README.txt, "Installing by hand", walks through
+# it. The "Scope Deck" folder is the app with its Python and workers beside it,
+# exactly as the installer lays it out; the plugin bundle and the Premiere
+# plugin sit next to it to be copied to their own folders.
+$stage    = Join-Path $buildDir "ScopeDeck-$Version-windows"
+$appStage = Join-Path $stage 'Scope Deck'
+if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+New-Item -ItemType Directory -Force $appStage | Out-Null
+foreach ($f in 'scopedeck.exe', 'timecode_poll_worker.py', 'subtitle_poll_worker.py') {
+    Copy-Item (Join-Path $buildDir $f) $appStage
+}
+Copy-Item $pythonDir (Join-Path $appStage 'python') -Recurse
+Copy-Item (Join-Path $buildDir 'bundle\ScopeTap.ofx.bundle') (Join-Path $stage 'ScopeTap.ofx.bundle') -Recurse
+Copy-Item $builtPrm $stage
+Copy-Item (Join-Path $root 'README.txt') $stage
+Copy-Item (Join-Path $root 'LICENSE') $stage
+New-Item -ItemType Directory -Force $distDir | Out-Null
+$zip = Join-Path $distDir "ScopeDeck-$Version-windows.zip"
+if (Test-Path $zip) { Remove-Item $zip }
+Compress-Archive -Path $stage -DestinationPath $zip
+Write-Host "Archive:   $zip" -ForegroundColor Green

@@ -130,6 +130,9 @@ rm -rf "$pkgroot"
 mkdir -p "$pkgroot/Applications" "$pkgroot/Library/OFX/Plugins"
 cp -R "$app" "$pkgroot/Applications/"
 cp -R "$bundle" "$pkgroot/Library/OFX/Plugins/"
+# Files copied on a Mac carry a provenance attribute; left in, pkgbuild
+# records a ._ sidecar for every file in the payload.
+xattr -cr "$pkgroot"
 
 # pkgbuild's default is to "relocate" a bundle onto wherever an older copy of
 # it lives, which would install over a build directory's Scope Deck.app on a
@@ -163,3 +166,19 @@ productbuild --distribution "$distribution" \
              "$out"
 
 echo "Installer: $out"
+
+# --- manual-install archive -------------------------------------------------------
+
+# The same two bundles the package installs, as a plain zip for anyone who
+# would rather drag them into place - README.txt, "Installing by hand", walks
+# through it. ditto keeps the bundles' structure and signatures intact.
+stage="$build_dir/ScopeDeck-$version-macos"
+rm -rf "$stage"
+mkdir -p "$stage"
+cp -R "$app" "$bundle" "$stage/"
+cp "$root/README.txt" "$root/LICENSE" "$stage/"
+xattr -cr "$stage"   # no __MACOSX sidecars in the zip, same reason as above
+zip_out="$dist_dir/ScopeDeck-$version-macos.zip"
+rm -f "$zip_out"
+ditto -c -k --keepParent "$stage" "$zip_out"
+echo "Archive:   $zip_out"

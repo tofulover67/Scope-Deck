@@ -1,0 +1,49 @@
+Scope Deck License
+==================
+
+This is the MIT License with one added condition (number 2 below): Scope Deck
+itself may not be sold. It is meant to be free for everyone.
+
+Copyright (c) 2026 Trevor Siebe
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, and sublicense copies of the
+Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+1. The above copyright notice and this permission notice shall be included in
+   all copies or substantial portions of the Software.
+
+2. The Software may not be sold. That is, Scope Deck - the application, its
+   plugins, and any build of them, modified or not, that is still
+   recognisably Scope Deck - may not be offered or distributed in exchange
+   for payment, whether as a one-off price, a subscription, an in-app
+   purchase, or as a paid add-on to something else. This condition does not
+   stop you from:
+
+   - using Scope Deck in paid work (a colourist charging for a grade is not
+     selling Scope Deck);
+   - charging for a genuinely different product of your own that reuses parts
+     of the source code, provided that product is not itself a version of
+     Scope Deck;
+   - charging for services around Scope Deck, such as support, training or
+     installation;
+   - recovering the actual cost of physical media it is copied onto.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Third-party code
+----------------
+
+The libraries under vendor/ (Dear ImGui, GLFW, stb_image, the OpenFX SDK)
+belong to their authors and come under their own licences, which are kept
+beside them and listed in vendor/VENDOR.md. Those licences are not changed by
+this file. Adobe's Premiere Pro SDK is not part of this repository.

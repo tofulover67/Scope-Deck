@@ -99,7 +99,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ScopeDeck-Setup-windows
-          path: dist/*.exe
+          path: |
+            dist/*.exe
+            dist/*.zip
           if-no-files-found: error
 
   macos:
@@ -119,7 +121,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ScopeDeck-macos
-          path: dist/*.pkg
+          path: |
+            dist/*.pkg
+            dist/*.zip
           if-no-files-found: error
 
   publish:
@@ -139,8 +143,12 @@ jobs:
           v="${{ needs.version.outputs.version }}"
           exe="$(ls artifacts/*.exe)"
           pkg="$(ls artifacts/*.pkg)"
+          zip_win="$(ls artifacts/*-windows.zip)"
+          zip_mac="$(ls artifacts/*-macos.zip)"
           sha_exe="$(sha256sum "$exe" | cut -d ' ' -f 1)"
           sha_pkg="$(sha256sum "$pkg" | cut -d ' ' -f 1)"
+          sha_zip_win="$(sha256sum "$zip_win" | cut -d ' ' -f 1)"
+          sha_zip_mac="$(sha256sum "$zip_mac" | cut -d ' ' -f 1)"
           cat > notes.md <<EOF_NOTES
           ## Windows
 
@@ -162,7 +170,14 @@ jobs:
           The installer is not signed, so macOS blocks it the first time: open System Settings → Privacy & Security and click **Open Anyway**. Only ever download it from this page.
 
           SHA-256 of $(basename "$pkg"): \`$sha_pkg\`
+
+          ## Installing by hand
+
+          \`$(basename "$zip_win")\` and \`$(basename "$zip_mac")\` hold the same files the installers put down, for anyone who would rather place them. README.txt, inside each archive and at the top of the repository, walks through it step by step for both platforms.
+
+          SHA-256 of $(basename "$zip_win"): \`$sha_zip_win\`
+          SHA-256 of $(basename "$zip_mac"): \`$sha_zip_mac\`
           EOF_NOTES
-          gh release create "v$v" "$exe" "$pkg" \
+          gh release create "v$v" "$exe" "$pkg" "$zip_win" "$zip_mac" \
             --repo "$GITHUB_REPOSITORY" --title "Scope Deck $v" \
             --notes-file notes.md --generate-notes --target "$GITHUB_SHA"
