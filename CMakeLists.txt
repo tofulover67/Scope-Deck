@@ -455,6 +455,52 @@ else()
                     "${CMAKE_CURRENT_SOURCE_DIR}/plugin/mac/ScopeTap-Info.plist"
                     "${OFX_BUNDLE_DIR}/Contents/Info.plist"
             VERBATIM)
+
+        # ------------------------------------------------------------------
+        # The Metal reduction - the macOS counterpart of the CUDA block below.
+        # Always built on macOS: the kernels are MSL source compiled at run
+        # time by the Metal framework, so no Metal toolchain (no Xcode) is
+        # needed, only the Command Line Tools. The tap keys off
+        # isEnabledMetalRender per render; a host that hands over host memory
+        # gets the unchanged CPU path, and SCOPE_TAP_NO_METAL declines Metal
+        # outright at describe time.
+        #
+        # No -ffp-contract flag reaches the GPU code: contraction there is
+        # switched off by `#pragma METAL fp contract(off)` inside the MSL
+        # source, and scope_conformance_metal is what proves it stayed off.
+        # ------------------------------------------------------------------
+        set_source_files_properties(core/ScopeMetal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        find_library(SCOPEDECK_FW_Metal Metal REQUIRED)
+        find_library(SCOPEDECK_FW_Foundation Foundation REQUIRED)
+
+        target_sources(ScopeTap PRIVATE core/ScopeMetal.mm core/ScopeMetal.h core/ScopeGpuTypes.h)
+        target_compile_definitions(ScopeTap PRIVATE SCOPE_TAP_METAL)
+        target_link_libraries(ScopeTap PRIVATE ${SCOPEDECK_FW_Metal} ${SCOPEDECK_FW_Foundation})
+
+        # scope_conformance_metal - the same harness with the Metal backend
+        # compiled in, so the kernels are judged bit-for-bit against the CPU
+        # reduction without Resolve in the loop. Run it with --hd before
+        # believing a result, and --bench for adversarial-content timing.
+        add_executable(scope_conformance_metal
+            tools/ScopeConformance.cpp
+            core/ScopeMetal.mm
+            core/ScopeMetal.h)
+        target_link_libraries(scope_conformance_metal PRIVATE scopecore_writer
+            ${SCOPEDECK_FW_Metal} ${SCOPEDECK_FW_Foundation})
+        target_include_directories(scope_conformance_metal PRIVATE core)
+        target_compile_definitions(scope_conformance_metal PRIVATE SCOPE_HAVE_METAL)
+        target_compile_options(scope_conformance_metal PRIVATE -Wall -Wextra -ffp-contract=off)
+
+        # scope_publish_race_metal - drives the real MetalTap::RenderFrame and
+        # publish hub into a scratch block and checks every slot carries its
+        # own frame, from one instance and from two (see the file's header).
+        # ScopeMetal.mm is compiled into that file, not listed here, because
+        # the hub is internal to it. release_mac.sh runs it.
+        add_executable(scope_publish_race_metal tools/ScopePublishRaceMetal.mm)
+        set_source_files_properties(tools/ScopePublishRaceMetal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_link_libraries(scope_publish_race_metal PRIVATE scopecore_writer
+            ${SCOPEDECK_FW_Metal} ${SCOPEDECK_FW_Foundation})
+        target_include_directories(scope_publish_race_metal PRIVATE core)
     endif()
 
     # ------------------------------------------------------------------

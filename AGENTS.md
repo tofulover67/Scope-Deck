@@ -30,7 +30,9 @@ compiling - you usually cannot test it, so make the smallest change there.
   tap, Inno Setup for the installer).
 - macOS: `build_mac.sh` / `deploy_mac.sh` / `release_mac.sh` (Apple clang via
   the Command Line Tools, CMake + Ninja from Homebrew, pkgbuild for the
-  installer). The OFX tap runs its CPU path on macOS; there is no Metal path yet.
+  installer). The OFX tap has a Metal path on macOS (`core/ScopeMetal.mm`,
+  kernels compiled at run time - no Xcode needed); `scope_conformance_metal`
+  and `scope_publish_race_metal` are its gates.
 - The Premiere Pro plugin (`plugin/ScopeTransmit.cpp`) is Windows-only; its
   compiled copy in `prebuilt/` is fingerprinted against
   `core/ScopeControl.*`, `core/ScopeCore.*`, `core/ScopeShm.*` and
@@ -45,8 +47,8 @@ compiling - you usually cannot test it, so make the smallest change there.
   reference; `-ffp-contract=off` is what keeps clang honest here) and
   `scope_publish_contention`.
 - Update `PORTING.md` when a feature's status changes, and
-  `GPU_PORT_HANDOFF.md` only for GPU-path work. Those two files are the
-  project's memory; nothing else is.
+  `GPU_PORT_HANDOFF.md` only for GPU-path work (CUDA and Metal alike). Those
+  two files are the project's memory; nothing else is.
 - `.gitattributes` turns line-ending conversion off for the whole tree because
   the files' endings are mixed as found. Do not "normalise" them.
 

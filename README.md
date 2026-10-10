@@ -17,8 +17,8 @@ Download the current release from this repository's Releases page.
   NVIDIA cards use the CUDA path; others use the CPU path.
 - **macOS:** `ScopeDeck-<version>.pkg`. Installs Scope Deck.app and the Scope
   Tap plugin into `/Library/OFX/Plugins`. Universal (Apple silicon and
-  Intel). The package is not signed; allow it once under System Settings >
-  Privacy & Security.
+  Intel); the tap reduces on the GPU through Metal. The package is not
+  signed; allow it once under System Settings > Privacy & Security.
 
 Then, in Resolve, add **Scope Tap** (OpenFX, *Scope Deck* group) to a node on
 the Color page and open Scope Deck.
@@ -60,7 +60,7 @@ folder. `release.ps1` / `release_mac.sh` are what the GitHub release runs.
 | Path | What |
 |---|---|
 | `app/` | The app: `main.cpp` (panels, menus, layout), the scope image builders, the audio / timecode / subtitle bridges, screen capture. `app/mac/` holds the macOS-only Objective-C++. |
-| `core/` | The wire format (`ScopeTypes.h`), its reader, the reduction engine, the shared-memory publisher, the CUDA reduction. No UI. |
+| `core/` | The wire format (`ScopeTypes.h`), its reader, the reduction engine, the shared-memory publisher, the CUDA (Windows) and Metal (macOS) reductions. No UI. |
 | `plugin/` | `ScopeTap` (OpenFX, Resolve) and `ScopeTransmit` (Premiere Pro, Windows). |
 | `tools/` | Conformance and contention harnesses, the headless probe, the self-test. |
 | `installer/` | Inno Setup script (Windows) and the pkg definition (macOS). |

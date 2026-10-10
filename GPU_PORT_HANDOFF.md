@@ -18,8 +18,9 @@ changelog and does not cover any of this.
 > planning anything, or you will plan around a port that is already there -
 > which happened once already, on 2026-09-22, and cost a session's orientation.
 >
-> Still CUDA only. AMD and Intel hosts fall through to the CPU path, working
-> but unaccelerated.
+> **Status, 2026-10-10: there is a Metal port too** - §5e. Same conformance
+> gate, same hub design, bit-exact, shipping in the macOS bundle. AMD and
+> Intel hosts on Windows still fall through to the CPU path.
 
 ---
 
@@ -816,6 +817,10 @@ checkbox is a different measurement.
 
 ### 5d. Then Metal, then OpenCL - but decide the order deliberately
 
+**Decided and done, 2026-10-10: Metal second.** See §5e. OpenCL (Windows AMD and
+Intel) remains the open item, and the ordering argument below is kept for
+the record.
+
 The original plan had Metal second. This tree had never been built on macOS when
 this was written; **as of 2026-10-10 it has** (see PORTING.md, "macOS port"):
 the app, the CPU ScopeTap and both gates build and pass on Apple silicon, so a
@@ -828,6 +833,113 @@ is the bigger commercial prize - but it is a business call, not a technical one,
 and it has never actually been made.
 
 ---
+
+### 5e. The Metal port - SHIPPED, bit-exact, measured on an M1 (2026-10-10)
+
+**Files.** `core/ScopeMetal.{h,mm}` - `MetalReducer` (conformance),
+`MetalTap` (the shipping path), `MetalFallbackTap` ("GPU Acceleration" off),
+`MetalPassthrough`; `core/ScopeGpuTypes.h` holds `GpuTapArgs`/`GpuTapStats`,
+now shared with CUDA so `plugin/ScopeTap.cpp` has ONE render body for both
+backends (`SCOPE_TAP_GPU`, with `GpuTapBackend` / `GpuFallbackBackend` /
+`GpuPassthrough` aliased per backend). The kernels are MSL source compiled at
+run time by the Metal framework - which is what lets the whole thing build
+with the Command Line Tools alone; no Xcode, no `xcrun metal`. Gates:
+`scope_conformance_metal` (same harness, `SCOPE_HAVE_METAL`; the harness body
+is generalised over `GpuReducer`) and `scope_publish_race_metal` (the real
+tap through the real hub, one and two instances). `release_mac.sh` runs both.
+
+**Built on the CUDA design, with three differences that follow from unified
+memory and Metal's API:**
+
+1. **No page-lock, no D2H.** Result buffers are `MTLStorageModeShared`; the
+   publish leg is the hub worker's memcpy into the slot after the command
+   buffer completes (0.68 ms at HD, measured in the race test). The mapping
+   itself can be wrapped as an `MTLBuffer` (`newBufferWithBytesNoCopy` on the
+   `shm_open` mapping was tested and works, and a blit wrote into it) - the
+   kernels could then write straight into the slot and the memcpy would go.
+   Not done: the memcpy is on the worker, not the render thread, and 0.7 ms
+   there costs Resolve nothing. The next step if the worker ever falls
+   behind.
+2. **One command buffer on the host's queue, committed and forgotten.** The
+   render thread encodes passthrough blit, fill, scatter, trace, probe and
+   preview and returns; the worker waits on the command buffer (the Metal
+   spelling of `cudaEventSynchronize`) and closes the seqlock. Device time
+   comes from `GPUStartTime`/`GPUEndTime`.
+3. **SIMD-group aggregation instead of `__match_any_sync`.** There is no
+   match instruction, so the kernel loops: ballot pending lanes, lowest is
+   leader, broadcast its address, ballot matches, leader adds the count -
+   one round per distinct address. **Bounded at two rounds**, then plain
+   atomics: unbounded it costs 32 rounds on spread content, measured 45 ms
+   for the frame against 8 with plain atomics.
+
+**The three bit-exactness traps hold on Metal.** The column table and the
+Cb/Cr reciprocals transfer unchanged. **Contraction is trap 3 again, and
+`fastMathEnabled = NO` does NOT prevent it** - measured with the harness's own
+detector values before any kernel was written: `a*a - c` came back 2^-24
+instead of 0 with fast math off. `#pragma METAL fp contract(off)` in the
+source is what stops it; with the pragma the result is 0 and matches the CPU.
+The first conformance run also found the histogram's output bound at buffer
+index 1, on top of the parameter block; the trace and probe then read their
+luma weights out of histogram counts. Every kernel's parameters are re-bound
+before every dispatch now.
+
+**What was measured, `scope_conformance_metal --bench`, Apple M1 (the 8-core
+GPU in a MacBook Air, the slowest Apple silicon there is), UHD, 200
+iterations per pattern, kernel time only:**
+
+| content | p50 | p90 | p99 |
+|---|---|---|---|
+| gradient (footage-like) | 8.20 | 11.38 | 13.90 ms |
+| spread | 7.78 | 10.68 | 13.78 |
+| black / white / grey / bars / hotpixel / outofrange | 7.9-8.7 | 11.3-11.7 | 12.6-13.7 |
+
+The flat patterns and the spread one cost the same, which says the
+aggregation is doing its job on both ends. The p90/p99 tail over a sustained
+200-iteration run is the Air's GPU clock, not content: short runs show p99
+within 10% of p50.
+
+**Where the time goes, found by switching pieces off (variants of the
+kernel, UHD, gradient):**
+
+| | ms |
+|---|---|
+| everything except the scatter (fill, trace, probe) | 0.75 |
+| scatter with loads and min/max only, no bins | 6.0 at 2 bands |
+| scatter, bins, no atomics at all | 5.3 at 2 bands -> **3.5 at 8 bands** |
+| full kernel | **~8** |
+
+So the load path is latency-bound, not bandwidth-bound (8 bands of rows per
+column, i.e. 4096 threadgroups in flight instead of 1024, nearly halved it;
+unrolling the row loop four deep on top bought nothing), and the atomics cost
+~4 ms over that floor however they are aggregated: a 12-run matrix over
+unroll {1,4} x aggregation rounds {1,2,4} x plain-vs-aggregated threadgroup
+atomics all landed between 7.1 and 9.4 ms p50 on footage. The shipping
+configuration is the simplest one in the band: one row per trip, two rounds,
+plain threadgroup atomics, eight bands.
+
+**Against the budget.** The 3-4 ms figure was set for a desktop NVIDIA card
+and this is the weakest Apple GPU; it is 2x over at UHD and inside it at HD
+(the race test's HD frames: 3.26 ms device, passthrough and preview
+included). The ship gate is still render-thread time and dropped frames, and
+the render thread here encodes and returns. The CPU tap on this same machine
+measured 12 ms *on the render thread* at HD (`fetch=0.03 copy=1-2 bin=8`),
+so even at UHD the Metal path moves the whole cost off the thread Resolve is
+waiting on. M1 Pro/Max and later parts have 2-8x this GPU.
+
+**What remains.**
+
+1. **The in-Resolve ship gate on macOS** - deploy, play graded footage, split
+   the log into bursts and count `t=` gaps, as §5c did on Windows. Not yet
+   run at the time of writing: deploying to `/Library/OFX/Plugins` needs an
+   administrator's password.
+2. **Zero-copy publish** (point 1 above) if the worker ever becomes the
+   bottleneck.
+3. **The load floor.** 3.5 ms to read 127 MB is well short of the M1's
+   bandwidth. The threadgroup-per-column mapping reads each row in 512
+   separate 128-byte pieces; a row-major tile mapping with the column table
+   indexed per pixel (as CUDA does) would read 256-byte runs and is the next
+   thing to try if UHD on small Apple GPUs matters.
+4. **`SCOPE_TAP_NO_METAL`** is the kill switch, as `SCOPE_TAP_NO_CUDA` is.
 
 ## 6. Gotchas
 

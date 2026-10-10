@@ -1,6 +1,7 @@
 #!/bin/bash
 # Builds what a GitHub release ships for macOS - a universal Scope Deck.app and
-# ScopeTap.ofx.bundle - checks it, and wraps it in ScopeDeck-<version>.pkg.
+# ScopeTap.ofx.bundle (with the Metal reduction) - checks it, and wraps it in
+# ScopeDeck-<version>.pkg.
 # The counterpart of release.ps1.
 #
 #   ./release_mac.sh                      build + check, installer as 0.0.0-dev
@@ -58,7 +59,8 @@ cmake -S "$root" -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DSCOPEDECK_VERSION="$version"
 
 echo "Building..."
-cmake --build "$build_dir" --target scopedeck ScopeTap scope_conformance scope_publish_contention
+cmake --build "$build_dir" --target scopedeck ScopeTap scope_conformance scope_publish_contention \
+      scope_conformance_metal scope_publish_race_metal
 
 # --- checks ---------------------------------------------------------------------
 
@@ -90,6 +92,15 @@ echo "Running scope_conformance..."
 # real reader. A few seconds.
 echo "Running scope_publish_contention..."
 "$build_dir/scope_publish_contention"
+
+# The Metal gates: the GPU reduction bit-exact against the reference over the
+# full matrix including the HD sweep (~30 s), and the real tap driven through
+# the real publish hub. A CI Mac has a GPU, so unlike the CUDA gate these run
+# on the runner.
+echo "Running scope_conformance_metal --hd..."
+"$build_dir/scope_conformance_metal" --hd
+echo "Running scope_publish_race_metal..."
+"$build_dir/scope_publish_race_metal"
 
 # Ad-hoc signed (no identity): seals the bundle's contents so a modified copy
 # fails verification, and gives TCC a signature to attach the audio and screen

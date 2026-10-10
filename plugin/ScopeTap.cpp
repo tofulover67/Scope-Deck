@@ -6,17 +6,38 @@
 // which includes an OFX header. That keeps the code that could take Resolve down
 // with it as small as possible, and lets the scope maths be tested without Resolve.
 //
-// CPU-only by design: no setSupportsCudaRender / OpenCL / Metal, so the host hands
-// us host-memory float RGBA with no vendor-specific code, and this file compiles
-// unchanged on macOS.
+// The CPU path is the baseline: with no GPU backend compiled in, no
+// setSupportsCudaRender / Metal is declared, the host hands us host-memory
+// float RGBA, and this file has no vendor-specific code at all. A GPU backend
+// (SCOPE_TAP_CUDA on Windows, SCOPE_TAP_METAL on macOS - see CMakeLists.txt)
+// adds the device path behind the same few names, so render() below is one
+// body for both.
 
 #include "ScopeTap.h"
 
 #include "ScopeCore.h"
 #include "ScopeShm.h"
 
-#ifdef SCOPE_TAP_CUDA
+#if defined(SCOPE_TAP_CUDA)
 #include "ScopeCuda.h"
+#define SCOPE_TAP_GPU 1
+namespace scopedeck
+{
+    using GpuTapBackend      = GpuTap;
+    using GpuFallbackBackend = CpuFallbackTap;
+    constexpr auto GpuPassthrough = CudaPassthrough;
+    constexpr const char* kGpuBackendName = "CUDA";
+}
+#elif defined(SCOPE_TAP_METAL)
+#include "ScopeMetal.h"
+#define SCOPE_TAP_GPU 1
+namespace scopedeck
+{
+    using GpuTapBackend      = MetalTap;
+    using GpuFallbackBackend = MetalFallbackTap;
+    constexpr auto GpuPassthrough = MetalPassthrough;
+    constexpr const char* kGpuBackendName = "Metal";
+}
 #endif
 
 #include "ofxsImageEffect.h"
@@ -161,11 +182,11 @@ private:
     scopedeck::ScopeResult    m_Result;
     scopedeck::ScopePublisher m_Publisher;
 
-#ifdef SCOPE_TAP_CUDA
-    scopedeck::GpuTap  m_GpuTap;
+#ifdef SCOPE_TAP_GPU
+    scopedeck::GpuTapBackend m_GpuTap;
     bool               m_GpuTapTried;
 
-    scopedeck::CpuFallbackTap m_CpuFallback;
+    scopedeck::GpuFallbackBackend m_CpuFallback;
     bool               m_CpuFallbackTried;
 #endif
 
@@ -185,7 +206,7 @@ ScopeTapPlugin::ScopeTapPlugin(OfxImageEffectHandle p_Handle)
     m_PublishVideo = fetchBooleanParam(kParamPublishVideo);
     m_PreviewScale = fetchChoiceParam(kParamPreviewScale);
     m_GpuAcceleration = fetchBooleanParam(kParamGpuAcceleration);
-#ifdef SCOPE_TAP_CUDA
+#ifdef SCOPE_TAP_GPU
     m_GpuTapTried = false;
     m_CpuFallbackTried = false;
 #endif
@@ -400,12 +421,19 @@ void ScopeTapPlugin::render(const OFX::RenderArguments& p_Args)
     const int height = rw.y2 - rw.y1;
     if ((width <= 0) || (height <= 0)) return;
 
-#ifdef SCOPE_TAP_CUDA
+#ifdef SCOPE_TAP_GPU
     // The GPU path. Taken only when the host actually handed over device memory
-    // this render - keyed off isEnabledCudaRender per call, never off the device
-    // name, so an OpenCL or CPU-mode host falls straight through to the host
-    // code below with no vendor sniffing.
-    if (p_Args.isEnabledCudaRender)
+    // this render - keyed off isEnabledCudaRender / isEnabledMetalRender per
+    // call, never off the device name, so an OpenCL or CPU-mode host falls
+    // straight through to the host code below with no vendor sniffing.
+#if defined(SCOPE_TAP_CUDA)
+    const bool gpuRender = p_Args.isEnabledCudaRender;
+    void* const gpuStream = p_Args.pCudaStream;
+#else
+    const bool gpuRender = p_Args.isEnabledMetalRender;
+    void* const gpuStream = p_Args.pMetalCmdQ;
+#endif
+    if (gpuRender)
     {
         const bool wantGpu = m_GpuAcceleration->getValueAtTime(p_Args.time);
         const bool thumbnail = (p_Args.renderScale.x < 0.999) || (p_Args.renderScale.y < 0.999);
@@ -444,7 +472,7 @@ void ScopeTapPlugin::render(const OFX::RenderArguments& p_Args)
                 args.dstRowBytes  = static_cast<size_t>(dst->getRowBytes());
                 args.width        = width;
                 args.height       = height;
-                args.stream       = p_Args.pCudaStream;
+                args.stream       = gpuStream;
                 args.timelineTime = p_Args.time;
                 args.instanceId   = m_InstanceId;
 
@@ -502,9 +530,9 @@ void ScopeTapPlugin::render(const OFX::RenderArguments& p_Args)
 
         // Device memory with the GPU reduction not in use: the image must still
         // pass through, and a host memcpy of a device pointer would fault.
-        scopedeck::CudaPassthrough(dst->getPixelData(), static_cast<size_t>(dst->getRowBytes()),
-                                   src->getPixelData(), static_cast<size_t>(src->getRowBytes()),
-                                   width, height, p_Args.pCudaStream);
+        scopedeck::GpuPassthrough(dst->getPixelData(), static_cast<size_t>(dst->getRowBytes()),
+                                  src->getPixelData(), static_cast<size_t>(src->getRowBytes()),
+                                  width, height, gpuStream);
 
         // GPU Acceleration turned off on a CUDA host. This used to publish
         // nothing at all - the image passed through and the app simply stopped
@@ -530,12 +558,12 @@ void ScopeTapPlugin::render(const OFX::RenderArguments& p_Args)
 
             if (m_CpuFallback.IsRunning())
             {
-                scopedeck::CpuFallbackTap::SubmitArgs sub;
+                scopedeck::GpuFallbackBackend::SubmitArgs sub;
                 sub.srcDevice    = src->getPixelData();
                 sub.srcRowBytes  = static_cast<size_t>(src->getRowBytes());
                 sub.width        = width;
                 sub.height       = height;
-                sub.stream       = p_Args.pCudaStream;
+                sub.stream       = gpuStream;
                 sub.timelineTime = p_Args.time;
                 sub.instanceId   = m_InstanceId;
 
@@ -554,7 +582,7 @@ void ScopeTapPlugin::render(const OFX::RenderArguments& p_Args)
 
                 const bool took = m_CpuFallback.Submit(sub);
 
-                scopedeck::CpuFallbackTap::FallbackStats st;
+                scopedeck::GpuFallbackBackend::FallbackStats st;
                 m_CpuFallback.Stats(st);
                 Log("#%llu  inst=%u  t=%.1f  %dx%d  step=%d  %s  CPU-on-GPU-host  "
                     "enqueue=%.3fms total=%.2fms  %s  copy=%.2fms bin=%.2fms  "
@@ -694,7 +722,7 @@ void ScopeTapFactory::describe(OFX::ImageEffectDescriptor& p_Desc)
     p_Desc.setRenderTwiceAlways(false);
     p_Desc.setSupportsMultipleClipPARs(kSupportsMultipleClipPARs);
 
-#ifdef SCOPE_TAP_CUDA
+#if defined(SCOPE_TAP_CUDA)
     // Declaring these is what gets us device pointers instead of host memory -
     // the whole point of the port, since the ~10 ms host passthrough is DRAM
     // bandwidth-bound and no CPU-side change moves it (GPU_PORT_HANDOFF.md §3).
@@ -716,6 +744,17 @@ void ScopeTapFactory::describe(OFX::ImageEffectDescriptor& p_Desc)
             p_Desc.setSupportsCudaRender(true);
             p_Desc.setSupportsCudaStream(true);
         }
+    }
+#elif defined(SCOPE_TAP_METAL)
+    // The Metal counterpart: Resolve on macOS then hands over id<MTLBuffer>s
+    // and its command queue, and the frame never leaves unified memory as a
+    // host copy. SCOPE_TAP_NO_METAL is the same kill switch as above - set it,
+    // restart Resolve, and the plugin is the plain CPU tap again.
+    {
+        const char* off = std::getenv("SCOPE_TAP_NO_METAL");
+        const bool disabled = off && off[0] && !(off[0] == '0' && !off[1]);
+        if (!disabled)
+            p_Desc.setSupportsMetalRender(true);
     }
 #else
     // No GPU render flags: declining them is what gets us host-memory float RGBA

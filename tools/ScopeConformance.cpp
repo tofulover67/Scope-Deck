@@ -47,11 +47,30 @@
 
 #include "ScopeCore.h"
 
-// The CUDA backend joins as one more candidate, compiled in only for the
-// CUDA-enabled target (see CMakeLists.txt). The CPU-only build is unchanged and
+// A GPU backend joins as one more candidate, compiled in only for the
+// GPU-enabled targets (see CMakeLists.txt): CUDA for scope_conformance_cuda,
+// Metal for scope_conformance_metal. Both offer the same Available / Error /
+// DeviceDescription / Analyse(..., timing) surface, so one harness body
+// serves both through the aliases below. The CPU-only build is unchanged and
 // still the one that runs everywhere.
-#ifdef SCOPE_HAVE_CUDA
+#if defined(SCOPE_HAVE_CUDA)
 #include "ScopeCuda.h"
+#define SCOPE_HAVE_GPU 1
+namespace scopedeck
+{
+    using GpuReducer       = CudaReducer;
+    using GpuReduceTiming  = CudaReduceTiming;
+    constexpr const char* kGpuBackendName = "cuda";
+}
+#elif defined(SCOPE_HAVE_METAL)
+#include "ScopeMetal.h"
+#define SCOPE_HAVE_GPU 1
+namespace scopedeck
+{
+    using GpuReducer       = MetalReducer;
+    using GpuReduceTiming  = MetalReduceTiming;
+    constexpr const char* kGpuBackendName = "metal";
+}
 #endif
 
 #include <algorithm>
@@ -826,7 +845,7 @@ struct Options
     std::string filter;
 };
 
-#ifdef SCOPE_HAVE_CUDA
+#ifdef SCOPE_HAVE_GPU
 // --- the adversarial-content bench -------------------------------------------
 //
 // Answers one question the ship gate cannot: the gate ran real graded footage,
@@ -839,11 +858,11 @@ struct Options
 // Kernel time only. The upload is reported separately and is not the tap's
 // cost: the tap's frame is already resident on the card. Quoting the total here
 // as "what the GPU tap costs" would be the fetch=/copy= conflation again.
-int RunBench(CudaReducer& p_Cuda, const Options& p_Options)
+int RunBench(GpuReducer& p_Cuda, const Options& p_Options)
 {
     if (!p_Cuda.Available())
     {
-        std::printf("bench: no CUDA device (%s)\n", p_Cuda.Error());
+        std::printf("bench: no %s device (%s)\n", kGpuBackendName, p_Cuda.Error());
         return 1;
     }
 
@@ -877,7 +896,7 @@ int RunBench(CudaReducer& p_Cuda, const Options& p_Options)
         // One untimed pass so allocation and any first-launch cost land outside
         // the sample - the same warmup effect that shows up as a 20-30 ms first
         // frame in the tap's own log.
-        CudaReduceTiming warm;
+        GpuReduceTiming warm;
         if (!p_Cuda.Analyse(view, params, out, &warm))
         {
             std::printf("  %-34s did not run (%s)\n", pattern.name, p_Cuda.Error());
@@ -886,7 +905,7 @@ int RunBench(CudaReducer& p_Cuda, const Options& p_Options)
 
         for (int i = 0; i < p_Options.benchIters; ++i)
         {
-            CudaReduceTiming t;
+            GpuReduceTiming t;
             if (!p_Cuda.Analyse(view, params, out, &t))
             {
                 std::printf("  %-34s did not run (%s)\n", pattern.name, p_Cuda.Error());
@@ -915,7 +934,7 @@ int RunBench(CudaReducer& p_Cuda, const Options& p_Options)
 
     std::printf("\nworst p99: %.3f ms (%s)\n", worstP99, worstName);
     std::printf("The ship gate's budget is 3-4 ms for the complete GPU tap, and the tap\n"
-                "adds the passthrough and the publish D2H on top of the figures above.\n");
+                "adds the passthrough and the publish leg on top of the figures above.\n");
     return 0;
 }
 #endif
@@ -940,8 +959,8 @@ int main(int argc, char** argv)
                         "  --verbose      print every case, not just failures\n"
                         "  --hd           add a 1920x1080 sweep (slower)\n"
                         "  --filter       only run cases whose name contains this substring\n"
-                        "  --bench        time the CUDA kernels on adversarial content instead\n"
-                        "                 of checking correctness (CUDA builds only)\n"
+                        "  --bench        time the GPU kernels on adversarial content instead\n"
+                        "                 of checking correctness (CUDA and Metal builds only)\n"
                         "  --bench-iters  iterations per pattern, default 200\n");
             return arg == "--help" ? 0 : 2;
         }
@@ -973,18 +992,18 @@ int main(int argc, char** argv)
     ScopeResult candidate;
     Frame frame;
 
-#ifdef SCOPE_HAVE_CUDA
-    CudaReducer cuda;
+#ifdef SCOPE_HAVE_GPU
+    GpuReducer cuda;
     if (options.bench) return RunBench(cuda, options);
     if (cuda.Available())
-        std::printf("cuda backend: %s\n\n", cuda.DeviceDescription());
+        std::printf("%s backend: %s\n\n", kGpuBackendName, cuda.DeviceDescription());
     else
-        std::printf("cuda backend: UNAVAILABLE (%s)\n\n", cuda.Error());
+        std::printf("%s backend: UNAVAILABLE (%s)\n\n", kGpuBackendName, cuda.Error());
     uint64_t cudaRuns = 0, cudaFailed = 0;
 #else
     if (options.bench)
     {
-        std::printf("--bench needs the CUDA build (scope_conformance_cuda).\n");
+        std::printf("--bench needs a GPU build (scope_conformance_cuda or scope_conformance_metal).\n");
         return 2;
     }
 #endif
@@ -1041,7 +1060,7 @@ int main(int argc, char** argv)
                         }
                     }
 
-#ifdef SCOPE_HAVE_CUDA
+#ifdef SCOPE_HAVE_GPU
                     if (cuda.Available())
                     {
                         ScopeResult gpu;
@@ -1051,7 +1070,7 @@ int main(int argc, char** argv)
                         {
                             ++cudaFailed;
                             char buf[512];
-                            std::snprintf(buf, sizeof(buf), "cuda: did not run (%s)", cuda.Error());
+                            std::snprintf(buf, sizeof(buf), "%s: did not run (%s)", kGpuBackendName, cuda.Error());
                             errors.push_back(buf);
                         }
                         else
@@ -1062,7 +1081,7 @@ int main(int argc, char** argv)
                             for (const std::string& e : gpuErrors)
                             {
                                 char buf[768];
-                                std::snprintf(buf, sizeof(buf), "cuda: %s", e.c_str());
+                                std::snprintf(buf, sizeof(buf), "%s: %s", kGpuBackendName, e.c_str());
                                 errors.push_back(buf);
                             }
                         }
@@ -1094,9 +1113,10 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(casesRun - casesPassed),
                 static_cast<unsigned long long>(comparisons));
 
-#ifdef SCOPE_HAVE_CUDA
+#ifdef SCOPE_HAVE_GPU
     if (cudaRuns > 0)
-        std::printf("cuda backend ran %llu cases, %llu failed to execute\n",
+        std::printf("%s backend ran %llu cases, %llu failed to execute\n",
+                    kGpuBackendName,
                     static_cast<unsigned long long>(cudaRuns),
                     static_cast<unsigned long long>(cudaFailed));
 #endif
