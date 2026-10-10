@@ -520,25 +520,32 @@ void ScopeTapPlugin::render(const OFX::RenderArguments& p_Args)
                     return;
                 }
 
-                // One failed frame: honour the passthrough below and say so.
-                // The next frame tries again, so a persistent fault shows up as
-                // a run of these rather than as a silent black output.
-                Log("#%llu  inst=%u  GPU frame failed (%s) - passthrough only",
+                // One failed frame: honour the passthrough below, reduce this
+                // frame on the CPU, and say so. The next frame tries the GPU
+                // again, so a persistent fault shows up as a run of these
+                // rather than as a silent black output or a frozen scope.
+                Log("#%llu  inst=%u  GPU frame failed (%s) - this frame reduces on the CPU",
                     callNo, m_InstanceId, m_GpuTap.Error());
             }
         }
 
         // Device memory with the GPU reduction not in use: the image must still
         // pass through, and a host memcpy of a device pointer would fault.
-        scopedeck::GpuPassthrough(dst->getPixelData(), static_cast<size_t>(dst->getRowBytes()),
-                                  src->getPixelData(), static_cast<size_t>(src->getRowBytes()),
-                                  width, height, gpuStream);
+        if (!scopedeck::GpuPassthrough(dst->getPixelData(), static_cast<size_t>(dst->getRowBytes()),
+                                       src->getPixelData(), static_cast<size_t>(src->getRowBytes()),
+                                       width, height, gpuStream))
+            Log("#%llu  inst=%u  GPU passthrough could not be queued", callNo, m_InstanceId);
 
-        // GPU Acceleration turned off on a CUDA host. This used to publish
-        // nothing at all - the image passed through and the app simply stopped
-        // updating, which is not what a box labelled "GPU Acceleration" should
-        // do when you untick it. It now means what it says: the reduction moves
-        // to the CPU.
+        // The reduction moves to the CPU whenever the GPU path did not take
+        // the frame: GPU Acceleration unticked, or the GPU path unavailable on
+        // this host (kernels that would not compile, a SIMD width the Metal
+        // kernels do not handle, a driver that refused to page-lock the block)
+        // or one frame it failed on. The first case used to publish nothing at
+        // all - the image passed through and the app simply stopped updating,
+        // which is not what a box labelled "GPU Acceleration" should do when
+        // you untick it - and until 0.4.2 so did the other two, while the log
+        // said "staying on CPU" and the app sat on Stale. Now every path that
+        // reaches this line publishes.
         //
         // The frame is on the card, so that needs a readback - but the render
         // thread does not wait for it. Waiting was measured at 28.5 ms a frame,
@@ -546,7 +553,7 @@ void ScopeTapPlugin::render(const OFX::RenderArguments& p_Args)
         // and it was slow enough to visibly hold Resolve up. The submit below
         // enqueues and returns, exactly as the GPU publish leg does; a worker
         // thread reduces and publishes once the copy lands.
-        if (publishing && !wantGpu)
+        if (publishing)
         {
             if (!m_CpuFallback.IsRunning() && !m_CpuFallbackTried)
             {
@@ -814,14 +821,15 @@ void ScopeTapFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc,
     // work, not part of adding the control.
     BooleanParamDescriptor* gpuAcceleration = p_Desc.defineBooleanParam(kParamGpuAcceleration);
     gpuAcceleration->setLabels("GPU Acceleration", "GPU Acceleration", "GPU Acceleration");
-    gpuAcceleration->setHint("Measure on the GPU instead of the CPU. On a CUDA host this "
-                             "removes the frame readback entirely - the scope data never "
+    gpuAcceleration->setHint("Measure on the GPU instead of the CPU. On a CUDA or Metal host "
+                             "this removes the frame readback entirely - the scope data never "
                              "enters system memory except as the finished bins. Ignored when "
-                             "the host is not using CUDA, where the CPU path runs regardless. "
-                             "Turning it off measures on the CPU instead, which on a CUDA host "
-                             "also has to copy the frame back from the card first and is "
-                             "markedly slower - expect dropped frames on a graded UHD "
-                             "timeline.");
+                             "the host hands over the frame in system memory, where the CPU "
+                             "path runs regardless; a GPU the path cannot use falls back to "
+                             "the CPU as well. Turning it off measures on the CPU instead, "
+                             "which on a GPU host also has to copy the frame back from the "
+                             "card first and is markedly slower - expect dropped frames on a "
+                             "graded UHD timeline.");
     gpuAcceleration->setDefault(true);
     page->addChild(*gpuAcceleration);
 

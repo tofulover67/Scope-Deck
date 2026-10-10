@@ -564,7 +564,7 @@ came after were the spec it was built against and are kept for the record.
   comparisons.** Bit-exact against the CPU reduction across 8 colour spaces, 5
   row steps, 8 patterns and 3 sizes. The three traps §5b warned about - the
   `columnStart` mapping, Cb/Cr scales derived from the luma weights, and the
-  accumulating trace - are all handled. Without `--hd` it is 640 cases in ~7 s;
+  accumulating trace - are all handled. Without `--hd` it is 1280 cases (640 before 0.4.2 added the 17x13 and 511x3 sizes, which catch bands with no sampled row) in ~7 s;
   with it, 960 in ~41 s. Run the `--hd` form before believing a result.
 - Both the CUDA `ScopeTap` and the full tree build with **zero warnings**.
 - **Live in Resolve**, UHD Rec.709, two instances, 218 steady-state renders, log
@@ -968,6 +968,21 @@ Resolve held 24 fps, so that is the viewer, not the tap.
    indexed per pixel (as CUDA does) would read 256-byte runs and is the next
    thing to try if UHD on small Apple GPUs matters.
 4. **`SCOPE_TAP_NO_METAL`** is the kill switch, as `SCOPE_TAP_NO_CUDA` is.
+5. **Fallback, fixed in 0.4.2.** A review found that when the GPU tap failed
+   to *start* on a GPU host (kernels not compiling, a SIMD width other than
+   32 - every AMD GPU in an Intel Mac - a second Metal device) the tap passed
+   the frame through and published nothing, while the log said "staying on
+   CPU". The same held for CUDA, and for any single frame `RenderFrame`
+   refused. `plugin/ScopeTap.cpp` now routes every frame the GPU path did
+   not take through the fallback tap (`MetalFallbackTap` / `CpuFallbackTap`),
+   the same path "GPU Acceleration" off uses. The Metal tap also declines a
+   row pitch that is not a whole number of RGBA float pixels (its scatter
+   kernel indexes in float4s, the CPU and CUDA in floats, so a padded pitch
+   would have misread silently) and a frame that extends past its buffer,
+   and `MetalFallbackTap` declines a queue on another device rather than blit
+   across devices. None of these is reachable with Resolve on an Apple
+   silicon Mac; all of them are reachable on a Mac this project has never run
+   on.
 
 ## 6. Gotchas
 

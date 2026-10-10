@@ -1309,6 +1309,24 @@ bool MetalTap::RenderFrame(const GpuTapArgs& p_Args)
         if (queue.device != impl.dev)
             return impl.Fail("device", "host queue is on a different Metal device");
 
+        // The scatter kernel indexes source rows in whole float4 pixels where
+        // the CPU path (and CUDA) index in floats, so a row pitch that is not a
+        // multiple of 16 bytes would have it read the wrong pixels - silently,
+        // since trace, probe and preview index in floats and would still agree
+        // with the CPU. Resolve pads nothing today; this is the guard for the
+        // day it does, and the caller falls back to the CPU for the frame. The
+        // buffers' lengths are checked for the same reason a bank checks a
+        // cheque: a kernel reading past its buffer faults the whole command
+        // buffer, and the mandatory passthrough is in that command buffer.
+        const size_t pixelBytes = 4 * sizeof(float);
+        const size_t rowBytes = static_cast<size_t>(width) * pixelBytes;
+        if (p_Args.srcRowBytes < rowBytes || p_Args.dstRowBytes < rowBytes ||
+            (p_Args.srcRowBytes % pixelBytes) != 0)
+            return impl.Fail("stride", "row pitch is not a whole number of RGBA float pixels");
+        if (src.length < p_Args.srcRowBytes * static_cast<size_t>(height - 1) + rowBytes ||
+            dst.length < p_Args.dstRowBytes * static_cast<size_t>(height - 1) + rowBytes)
+            return impl.Fail("bounds", "frame extends past its Metal buffer");
+
         // --- reserve a ring entry and its ticket, together ----------------------
         PublishHub& hub = Hub();
         uint64_t ticket = 0;
@@ -1610,6 +1628,17 @@ bool MetalFallbackTap::Submit(const SubmitArgs& p_Args)
 
         id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)p_Args.stream;
         id<MTLBuffer> src = (__bridge id<MTLBuffer>)p_Args.srcDevice;
+        // The staging buffer is on the default device. A blit on another
+        // device's queue into it is invalid Metal usage - a GPU fault inside
+        // Resolve on a Mac with two GPUs or an eGPU - so decline, as MetalTap
+        // does, rather than encode it.
+        if (queue.device != impl.dev)
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            impl.busy = false;
+            std::snprintf(impl.error, sizeof(impl.error), "host queue is on a different Metal device");
+            return false;
+        }
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         if (!cb)
         {

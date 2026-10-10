@@ -56,6 +56,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>     // PaceToDisplay
 #include <utility>
 #include <vector>
 #include <deque>
@@ -664,6 +665,10 @@ struct CompareState
     float          builtChromaLo   = 0.0f;
     float          builtChromaHi   = 0.0f;
     float          builtLuma[3]    = { 0.0f, 0.0f, 0.0f };
+
+    // Which still `texture` holds. Size alone was the key once, and a second
+    // Capture from Source - same size every time - kept showing the first.
+    uint64_t uploadedGeneration = UINT64_MAX;
 };
 
 struct GrainAnalyzerState
@@ -7718,7 +7723,8 @@ void DrawComparePanel(App& p_App, Panel& p_Panel)
 
     EnsureCompareOverlayBins(st);
 
-    if (!st.texture.Valid() || st.texture.Width() != st.still.width || st.texture.Height() != st.still.height)
+    if (!st.texture.Valid() || st.uploadedGeneration != st.still.generation
+        || st.texture.Width() != st.still.width || st.texture.Height() != st.still.height)
     {
         st.image.Resize(st.still.width, st.still.height);
         const uint8_t* src = st.still.rgb.data();
@@ -7732,6 +7738,7 @@ void DrawComparePanel(App& p_App, Panel& p_Panel)
             dst[i * 4 + 3] = 255;
         }
         st.texture.UploadRGBA(st.image.pixels.data(), st.image.width, st.image.height);
+        st.uploadedGeneration = st.still.generation;
     }
 
     draw->PushClipRect(avail.Min, avail.Max, true);
@@ -9506,6 +9513,33 @@ void PlaceMainWindow(App& p_App, GLFWwindow* p_Window, RenderContext& p_Ctx)
 // you let go. GLFW's refresh callback fires synchronously from inside that
 // same modal loop on every intermediate size, which is exactly what makes
 // the resize track the cursor instead of jumping once at the end.
+#ifdef __APPLE__
+// Hold the frame rate to the display's. glfwSwapInterval(1) does not do it on
+// this platform: measured on an M1 Air's 60 Hz panel, the app ran at 84 fps
+// and about 70% of a core redrawing an unchanged picture - the same sort of
+// waste the Windows path cured with DwmFlush (see g_GlVsync). There is no
+// compositor fence to wait on here, so the wait is a clock: each frame is
+// due one refresh interval after the last, and a frame that finishes early
+// sleeps until then. A frame that runs long resets the schedule rather than
+// trying to catch up, so a slow frame costs one frame and not a burst.
+void PaceToDisplay()
+{
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point s_Next = Clock::now();
+
+    int hz = 0;
+    if (GLFWmonitor* monitor = glfwGetPrimaryMonitor())
+        if (const GLFWvidmode* mode = glfwGetVideoMode(monitor)) hz = mode->refreshRate;
+    if (hz <= 0) hz = 60;
+    const auto interval = std::chrono::nanoseconds(1000000000LL / hz);
+
+    const Clock::time_point now = Clock::now();
+    if (now < s_Next) std::this_thread::sleep_until(s_Next);
+    else              s_Next = now;
+    s_Next += interval;
+}
+#endif
+
 void RenderOneFrame(GLFWwindow* p_Window, RenderContext& p_Ctx)
 {
     App& app = *p_Ctx.app;
@@ -9738,6 +9772,8 @@ void RenderOneFrame(GLFWwindow* p_Window, RenderContext& p_Ctx)
 #ifdef _WIN32
     // Pace on the compositor's vblank rather than in the driver - see g_GlVsync.
     if (!g_GlVsync) DwmFlush();
+#elif defined(__APPLE__)
+    PaceToDisplay();
 #endif
 }
 
@@ -10075,6 +10111,14 @@ int main(int argc, char** argv)
     while (!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
+        // Cmd+Q, Quit from the Dock and logout arrive as a close request on
+        // every window at once, the popped-out panels' own windows included.
+        // One more frame after that and ImGui reports each of those panels
+        // closed, the deck drops them, and the layout saved below has lost
+        // them. Checked again here so that frame is never drawn. The menu's
+        // Quit and the title bar's close button set it on the main window
+        // alone and never had the problem.
+        if (glfwWindowShouldClose(window)) break;
         RenderOneFrame(window, renderCtx);
     }
 
