@@ -827,6 +827,11 @@ struct Size { int width; int height; const char* note; };
 const Size kSizes[] = {
     {  64,  64, "narrower than the waveform: most columns empty" },
     { 517, 289, "prime-ish: ragged buckets, no Row Step divides it" },
+    // Shorter than threads x rowStep: row bands with no sampled row in them.
+    // The engine's merge once walked its partial buffers by worker count
+    // rather than by band and mixed a previous frame's bins into these.
+    {  17,  13, "shorter than threads x step: bands with no sampled row" },
+    { 511,   3, "three rows: at step 2 and up most bands are empty" },
 };
 
 const int kRowSteps[] = { 1, 2, 3, 4, 8 };

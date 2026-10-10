@@ -318,6 +318,8 @@ void ScopeEngine::Analyse(const FrameView& p_Frame, const ScopeParams& p_Params,
 
     std::vector<std::thread> workers;
     workers.reserve(static_cast<size_t>(threads));
+    std::vector<int> bands;            // the t of every band that actually ran
+    bands.reserve(static_cast<size_t>(threads));
 
     for (int t = 0; t < threads; ++t)
     {
@@ -328,6 +330,7 @@ void ScopeEngine::Analyse(const FrameView& p_Frame, const ScopeParams& p_Params,
         if (y0 % p_RowStep) y0 += p_RowStep - (y0 % p_RowStep);
         if (y0 >= y1) continue;
 
+        bands.push_back(t);
         Partial& partial = m_Partials[static_cast<size_t>(t)];
         const LumaWeights luma = p_Params.luma;
         workers.emplace_back([this, &p_Frame, columnStart, luma, y0, y1, p_RowStep, &partial]()
@@ -357,10 +360,15 @@ void ScopeEngine::Analyse(const FrameView& p_Frame, const ScopeParams& p_Params,
     uint32_t* vec  = p_Out.vectorscope.data();
     uint32_t* tp   = p_Out.twinPeaks.data();
 
-    for (size_t t = 0; t < workers.size(); ++t)
+    // Only the bands that ran. A band whose rows hold no multiple of p_RowStep
+    // spawns no worker (the `continue` above), so the workers do not line up
+    // with the first N partials: walking workers.size() here dropped the last
+    // band and merged whatever the previous frame had left in a skipped band's
+    // buffer. Any frame shorter than threads x rowStep rows hit it; HD never
+    // did, which is why conformance's 64x64 and 517x289 never saw it.
+    for (int t : bands)
     {
-        const Partial& partial = m_Partials[t];
-        if (partial.waveform.empty()) continue;
+        const Partial& partial = m_Partials[static_cast<size_t>(t)];
 
         const uint32_t* pw = partial.waveform.data();
         for (uint64_t i = 0; i < kWaveformCells; ++i) wave[i] += pw[i];
