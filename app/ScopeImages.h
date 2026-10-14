@@ -208,7 +208,17 @@ inline void CbCrOfRgb(float p_R, float p_G, float p_B, const float p_LumaCoeff[3
 // here. Global app state, not per-panel: the mask means the same region to
 // every preview panel that reads it, the same way it did in the old app
 // (MainWindow.spatial_mask_*, not VideoPanel's own).
-enum class MaskShape { Ellipse, Rectangle, Gradient };
+//
+// Pixels is never drawn by hand and never offered in the Mask Shape combo: it
+// is the Source panel's "Track Cursor" probe (see MakePixelProbeMask), an
+// axis-aligned block of whole preview pixels the scopes measure in place of
+// the drawn mask while the cursor is over the image. It goes through the same
+// SpatialMask plumbing as a drawn mask so every masked scope picks it up for
+// free, but the builders that subsample the frame (the per-scanline traces,
+// the Color Cube's point cloud, the Hue histogram) check for it and sample
+// its block densely instead - a stride across the whole frame would step
+// straight over a single pixel more often than not.
+enum class MaskShape { Ellipse, Rectangle, Gradient, Pixels };
 
 struct SpatialMask
 {
@@ -218,8 +228,20 @@ struct SpatialMask
     // Fractions of the image (0..1) for Ellipse/Rectangle's two opposite
     // corners, or Gradient's start/end point. `angle` (radians) rotates
     // Ellipse/Rectangle about their own centre; meaningless for Gradient.
+    // For Pixels, the block's outer edges in the builders' own pixel-position
+    // mapping (x / (width - 1)), half a pixel outside the first and last
+    // pixel kept, so the inside test never hinges on float equality.
     float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f, angle = 0.0f;
 };
+
+// A Pixels mask covering p_Size x p_Size preview pixels centred on pixel
+// (p_Px, p_Py) of a p_Width x p_Height preview, clipped to the image.
+SpatialMask MakePixelProbeMask(int p_Px, int p_Py, int p_Size, int p_Width, int p_Height);
+
+// The inclusive preview-pixel block a Pixels mask keeps, for a frame of the
+// given size. False for every other shape, which has no such block.
+bool PixelProbeBounds(const SpatialMask& p_Mask, int p_Width, int p_Height,
+                      int& p_OutX0, int& p_OutY0, int& p_OutX1, int& p_OutY1);
 
 // 1.0 = full colour, 0.0 = fully masked out, continuous only for Gradient -
 // Ellipse/Rectangle are hard-edged, matching the old app (it never had a
@@ -704,6 +726,13 @@ inline const char* ColorCubeSpaceName(ColorCubeSpace p_Space)
         default:                  return "?";
     }
 }
+
+// One 0..1 RGB value's position in the cube, in the same units as
+// ColorCubePoint below - what BuildColorCubePoints positions every sample
+// with, so a single value (the Track Cursor probe's) lands exactly where the
+// cloud would draw it.
+void ColorCubePositionOf(float p_R, float p_G, float p_B, ColorCubeSpace p_Space,
+                         float& p_OutX, float& p_OutY, float& p_OutZ);
 
 // A sample's position (each axis normalised to roughly -1..1, matching
 // whatever COLOR_CUBE_AXIS_RANGES-equivalent the space needs so RGB/XYZ/Lab

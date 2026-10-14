@@ -346,6 +346,15 @@ enum class CompositionGrid
 // construction rather than four constructions - see DrawFibonacciSpiral.
 enum class SpiralCorner { BottomRight, BottomLeft, TopRight, TopLeft };
 
+// How the scopes show Track Cursor's probe (see App::cursorProbe). Crosshair
+// leaves every scope reading the whole frame and marks where the probed value
+// sits on it - the way Resolve's own viewer picker reads. Isolate measures
+// only the probed pixels, the way a drawn mask does.
+enum class CursorProbeStyle { Crosshair, Isolate, Count };
+
+// The square block sizes offered for the probe, in preview pixels.
+constexpr int kProbeSizes[] = { 1, 3, 5, 9, 15 };
+
 struct SourceState
 {
     Texture texture;
@@ -361,6 +370,37 @@ struct SourceState
 
     CompositionGrid grid         = CompositionGrid::None;
     SpiralCorner    spiralCorner = SpiralCorner::BottomRight;
+
+    // Track Cursor - see App::cursorProbe. Saved, unlike the mask: it is a
+    // standing way of working with the panel, not a piece of grading work.
+    bool             trackCursor = false;
+    CursorProbeStyle probeStyle  = CursorProbeStyle::Crosshair;
+    int              probeSize   = 1;
+};
+
+// What a Source panel is hovering this frame, recorded as it draws - see
+// App::cursorProbe for why it only takes effect on the next frame.
+struct CursorProbeRequest
+{
+    bool             set   = false;
+    CursorProbeStyle style = CursorProbeStyle::Crosshair;
+    SpatialMask      mask;   // a Pixels mask - see MakePixelProbeMask
+};
+
+struct CursorProbe
+{
+    bool        active  = false;
+    bool        isolate = false;   // Isolate style: scopeMask is this probe's own block
+    SpatialMask mask;
+
+    // Mean of the probed block, in 0..1 preview values - the same units every
+    // per-scanline trace sample is in, so each scope maps it to the screen
+    // exactly the way it maps its own trace.
+    float       rgb[3] = { 0.0f, 0.0f, 0.0f };
+    float       luma   = 0.0f;
+
+    // The block's centre across the image, 0..1 - a waveform's x axis.
+    float       fx     = 0.5f;
 };
 
 // Which part of the spatial mask a left-drag is currently manipulating.
@@ -1340,8 +1380,26 @@ struct App
     // masked-scope re-bin - see CombinedMaskWeight/ValueQualifierPasses.
     ValueQualifier   valueQualifier;
 
+    // Track Cursor (a Source panel setting): the preview pixel(s) under the
+    // pointer while it is over a Source image. A Source panel only knows the
+    // pointer's place in the image while it draws, which can be before or
+    // after any given scope, so it records the request and ResolveCursorProbe
+    // turns that into cursorProbe at the top of the next frame - one frame
+    // behind the pointer, but every scope in a frame agreeing on one probe.
+    CursorProbeRequest cursorProbeRequest;
+    CursorProbe        cursorProbe;
+
+    // What every measuring scope restricts itself to this frame: spatialMask,
+    // or the probe's own block while Track Cursor's Isolate style is probing.
+    // Snapshotted once per frame alongside maskedScope, so a scope's cached
+    // picture and the bins it was built from always name the same mask. The
+    // preview-tier panels (Source, False Color, Skin Tone) keep reading
+    // spatialMask itself - dimming all but one pixel of the picture would
+    // only get in the way of seeing what the pointer is over.
+    SpatialMask        scopeMask;
+
     // Waveform/Histogram/Vectorscope/White Balance re-binned from the preview,
-    // restricted to spatialMask - see BuildMaskedScopeBins's own comment for why
+    // restricted to scopeMask - see BuildMaskedScopeBins's own comment for why
     // this exists at all (the tap's own bins are already summed over the full
     // frame by the time the app sees them). Recomputed once per DrawFrame call,
     // not once per panel - every masked panel that frame reads the same result.
@@ -1400,23 +1458,109 @@ void RebuildValueQualifier(App& p_App)
 
 void EnsureMaskedScopeBins(App& p_App)
 {
-    if (!p_App.spatialMask.hasGeometry && !p_App.valueQualifier.AnyActive())
+    if (!p_App.scopeMask.hasGeometry && !p_App.valueQualifier.AnyActive())
     {
         p_App.maskedScopeValid = false;
         return;
     }
 
     const bool frameChanged     = p_App.maskedScopeFrame != p_App.frame.frameIndex;
-    const bool maskChanged      = !SpatialMaskEquals(p_App.maskedScopeForMask, p_App.spatialMask);
+    const bool maskChanged      = !SpatialMaskEquals(p_App.maskedScopeForMask, p_App.scopeMask);
     const bool qualifierChanged = !ValueQualifierEquals(p_App.maskedScopeForQualifier, p_App.valueQualifier);
 
     if (p_App.maskedScopeValid && !frameChanged && !maskChanged && !qualifierChanged) return;
 
-    BuildMaskedScopeBins(p_App.frame, p_App.spatialMask, p_App.maskedScope, &p_App.valueQualifier);
+    BuildMaskedScopeBins(p_App.frame, p_App.scopeMask, p_App.maskedScope, &p_App.valueQualifier);
     p_App.maskedScopeFrame        = p_App.frame.frameIndex;
-    p_App.maskedScopeForMask      = p_App.spatialMask;
+    p_App.maskedScopeForMask      = p_App.scopeMask;
     p_App.maskedScopeForQualifier = p_App.valueQualifier;
     p_App.maskedScopeValid        = true;
+}
+
+// Turns last frame's CursorProbeRequest into this frame's cursorProbe, measured
+// from this frame's pixels (so a probe held still over playing video follows
+// the picture), and settles scopeMask. Call once per frame, before
+// EnsureMaskedScopeBins - it decides the mask that function bins through.
+void ResolveCursorProbe(App& p_App)
+{
+    const CursorProbeRequest request = p_App.cursorProbeRequest;
+    p_App.cursorProbeRequest = CursorProbeRequest{};
+
+    CursorProbe& probe = p_App.cursorProbe;
+    probe = CursorProbe{};
+
+    const ScopeFrame& frame = p_App.frame;
+    const int width  = int(frame.previewWidth);
+    const int height = int(frame.previewHeight);
+    int x0, y0, x1, y1;
+    if (request.set && p_App.haveFrame && frame.HasPreview()
+        && PixelProbeBounds(request.mask, width, height, x0, y0, x1, y1))
+    {
+        double sum[3] = { 0.0, 0.0, 0.0 };
+        for (int y = y0; y <= y1; ++y)
+        {
+            const uint8_t* row = frame.preview.data() + size_t(y) * size_t(width) * 3;
+            for (int x = x0; x <= x1; ++x)
+                for (int c = 0; c < 3; ++c)
+                    sum[c] += row[x * 3 + c];
+        }
+
+        const double count = double(x1 - x0 + 1) * double(y1 - y0 + 1);
+        for (int c = 0; c < 3; ++c)
+            probe.rgb[c] = float(sum[c] / count / 255.0);
+        probe.luma = frame.lumaCoeff[0] * probe.rgb[0] + frame.lumaCoeff[1] * probe.rgb[1]
+                   + frame.lumaCoeff[2] * probe.rgb[2];
+
+        // Texel centres, the same place a waveform column draws its own
+        // samples (column = x * columns / width, drawn at the column's middle).
+        probe.fx = (float(x0 + x1) * 0.5f + 0.5f) / float(width);
+
+        probe.active  = true;
+        probe.isolate = (request.style == CursorProbeStyle::Isolate);
+        probe.mask    = request.mask;
+    }
+
+    p_App.scopeMask = (probe.active && probe.isolate) ? probe.mask : p_App.spatialMask;
+}
+
+// True while Isolate is narrowing every scope to the probe's few pixels. The
+// Enhanced Render traces step aside then for their binned pictures: a block
+// that small lands in one or two trace columns, and a line trace has nothing
+// to draw a line between (BuildMaskedScopeBins skips the trace for it too).
+bool ProbeIsolating(const App& p_App)
+{
+    return p_App.cursorProbe.active && p_App.cursorProbe.isolate;
+}
+
+// The probe's mark on a scope: a crosshair with a hole in the middle so the
+// trace at the exact spot stays visible, dark under bright so it reads over an
+// empty background and a hot trace alike.
+void DrawProbeCrosshair(ImDrawList* p_Draw, const ImVec2& p_At, float p_Gap = 3.0f)
+{
+    const float arm = p_Gap + 7.0f;
+    const ImVec2 dirs[4] = { ImVec2(1.0f, 0.0f), ImVec2(-1.0f, 0.0f), ImVec2(0.0f, 1.0f), ImVec2(0.0f, -1.0f) };
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        const ImU32 col   = pass == 0 ? kColProbeOutline : kColProbe;
+        const float thick = pass == 0 ? 3.0f : 1.0f;
+        for (const ImVec2& d : dirs)
+            p_Draw->AddLine(ImVec2(p_At.x + d.x * p_Gap, p_At.y + d.y * p_Gap),
+                            ImVec2(p_At.x + d.x * arm,   p_At.y + d.y * arm), col, thick);
+    }
+}
+
+// The same mark on a scope whose value axis is horizontal (Histogram, Luma vs
+// Sat, Hue vs Sat): a line down the plot at the probed value.
+void DrawProbeLine(ImDrawList* p_Draw, float p_X, float p_Top, float p_Bottom)
+{
+    p_Draw->AddLine(ImVec2(p_X, p_Top), ImVec2(p_X, p_Bottom), kColProbeOutline, 3.0f);
+    p_Draw->AddLine(ImVec2(p_X, p_Top), ImVec2(p_X, p_Bottom), kColProbe, 1.0f);
+}
+
+// The probe's value on one waveform/histogram plane, 0..1.
+float ProbePlaneValue(const CursorProbe& p_Probe, uint32_t p_Plane)
+{
+    return p_Plane == kPlaneY ? p_Probe.luma : p_Probe.rgb[std::min<uint32_t>(p_Plane, 2u)];
 }
 
 // ---------------------------------------------------------------------------
@@ -1691,6 +1835,10 @@ void CollectSettingFields(App& p_App,
         p_Out.push_back({ key("src.grid"), FieldType::Int, reinterpret_cast<int*>(&src.grid) });
         p_Out.push_back({ key("src.spiralCorner"), FieldType::Int,
                           reinterpret_cast<int*>(&src.spiralCorner) });
+        p_Out.push_back({ key("src.trackCursor"), FieldType::Bool, &src.trackCursor });
+        p_Out.push_back({ key("src.probeStyle"),  FieldType::Int,
+                          reinterpret_cast<int*>(&src.probeStyle) });
+        p_Out.push_back({ key("src.probeSize"),   FieldType::Int,  &src.probeSize });
 
         CollectCommonFields(panel.common, prefix, p_Out, p_KeyStorage);
     }
@@ -2670,10 +2818,10 @@ void DrawWaveformPanel(App& p_App, Panel& p_Panel)
     // "restrict, don't fabricate" rule the masked bins use.
     const std::vector<float>* maskedTrace = maskActive ? &p_App.maskedScope.waveformTrace : nullptr;
     const bool enhancedReady =
-        st.enhancedRender && !p_App.prefs.disableEnhancedRender &&
+        st.enhancedRender && !p_App.prefs.disableEnhancedRender && !ProbeIsolating(p_App) &&
         PrepareEnhancedTraceCached(p_App.frame, st.signalPrefilter, st.smoothTrace,
                                    st.lowPassKernel, st.traceState, st.preparedTrace,
-                                   maskedTrace, p_App.spatialMask, p_App.valueQualifier,
+                                   maskedTrace, p_App.scopeMask, p_App.valueQualifier,
                                    st.traceCache);
     if (enhancedReady)
     {
@@ -2707,7 +2855,7 @@ void DrawWaveformPanel(App& p_App, Panel& p_Panel)
                         || st.builtLo     != lo
                         || st.builtHi     != hi
                         || st.builtMasked != maskActive
-                        || !SpatialMaskEquals(st.builtMask, p_App.spatialMask)
+                        || !SpatialMaskEquals(st.builtMask, p_App.scopeMask)
                         || !ValueQualifierEquals(st.builtQualifier, p_App.valueQualifier);
         if (stale)
         {
@@ -2741,7 +2889,7 @@ void DrawWaveformPanel(App& p_App, Panel& p_Panel)
             st.builtLo         = lo;
             st.builtHi         = hi;
             st.builtMasked     = maskActive;
-            st.builtMask       = p_App.spatialMask;
+            st.builtMask       = p_App.scopeMask;
             st.builtQualifier  = p_App.valueQualifier;
         }
 
@@ -2768,6 +2916,27 @@ void DrawWaveformPanel(App& p_App, Panel& p_Panel)
     // After the trace: these are references the signal is read against, so the
     // trace must not cover them.
     DrawBoundingLines(draw, rect, common, p_App.frame, lo, hi);
+
+    // Track Cursor: where the probed pixel sits on each plane shown - at its
+    // own column across the image and its own level, mapped exactly the way
+    // DrawEnhancedTrace maps a trace sample.
+    if (p_App.cursorProbe.active)
+    {
+        const uint32_t* planes = kYrgbPlanes;
+        int planeCount = 4;
+        if (st.mode == WaveformMode::Parade)    { planes = kParadePlanes; planeCount = 3; }
+        else if (st.mode == WaveformMode::Luma) { planes = kLumaPlanes;   planeCount = 1; }
+
+        const float cellW = rect.GetWidth() / float(cells);
+        for (int i = 0; i < planeCount; ++i)
+        {
+            const int   cell  = (cells > 1) ? i : 0;
+            const float level = p_App.frame.LevelOfValue(ProbePlaneValue(p_App.cursorProbe, planes[i]));
+            const float t     = (std::clamp(level, float(lo), float(hi)) - float(lo)) / float(hi - lo);
+            DrawProbeCrosshair(draw, ImVec2(rect.Min.x + cellW * (float(cell) + p_App.cursorProbe.fx),
+                                            rect.Max.y - t * rect.GetHeight()));
+        }
+    }
 
     // Cursor readout: the value under the pointer, reported rather than eyeballed.
     if (st.showCursor && ImGui::IsWindowHovered() && plotArea.Contains(ImGui::GetIO().MousePos))
@@ -2866,6 +3035,14 @@ float HistogramValueOfX(const ScopeFrame& p_Frame, const ImRect& p_Content, floa
     const float t = p_Content.GetWidth() > 0.0f
         ? std::clamp((p_X - p_Content.Min.x) / p_Content.GetWidth(), 0.0f, 1.0f) : 0.0f;
     return p_Frame.binRangeLow + t * (p_Frame.binRangeHigh - p_Frame.binRangeLow);
+}
+
+// The forward direction of HistogramValueOfX, for drawing a value onto the
+// same axis.
+float HistogramXOfValue(const ScopeFrame& p_Frame, const ImRect& p_Content, float p_Value)
+{
+    const float t = (p_Value - p_Frame.binRangeLow) / (p_Frame.binRangeHigh - p_Frame.binRangeLow);
+    return p_Content.Min.x + t * p_Content.GetWidth();
 }
 
 // Click-drag directly on a lane selects a value range on that plane - see
@@ -3069,6 +3246,10 @@ void DrawHistogramPanel(App& p_App, Panel& p_Panel)
             if (st.qualifyActive[planes[i]])
                 DrawHistogramQualifierOverlay(draw, laneRects[i], content, p_App.frame,
                                               st.qualifyLo[planes[i]], st.qualifyHi[planes[i]]);
+            if (p_App.cursorProbe.active)
+                DrawProbeLine(draw, HistogramXOfValue(p_App.frame, content,
+                                                      ProbePlaneValue(p_App.cursorProbe, planes[i])),
+                              laneRects[i].Min.y, laneRects[i].Max.y);
         }
     }
     else
@@ -3082,6 +3263,14 @@ void DrawHistogramPanel(App& p_App, Panel& p_Panel)
 
         for (int i = 0; i < planeCount; ++i)
             DrawHistogramLane(draw, lane, content, p_App.frame, planes[i], peak, st.logScale, 40, histCounts);
+
+        // One line per channel, all over the one lane - the same overlap the
+        // curves themselves have.
+        if (p_App.cursorProbe.active)
+            for (int i = 0; i < planeCount; ++i)
+                DrawProbeLine(draw, HistogramXOfValue(p_App.frame, content,
+                                                      ProbePlaneValue(p_App.cursorProbe, planes[i])),
+                              lane.Min.y, lane.Max.y);
     }
 
     if (maskActive && p_App.maskedScope.empty)
@@ -3441,10 +3630,10 @@ void DrawVectorscopeWheel(App& p_App, VectorscopeState& p_St, PanelCommon& p_Com
     // buffer, since both scopes derive from the same per-scanline samples.
     const std::vector<float>* maskedTrace = p_App.maskedScopeValid ? &p_App.maskedScope.waveformTrace : nullptr;
     const bool enhancedReady =
-        p_St.enhancedRender && p_App.haveFrame && !p_App.prefs.disableEnhancedRender &&
+        p_St.enhancedRender && p_App.haveFrame && !p_App.prefs.disableEnhancedRender && !ProbeIsolating(p_App) &&
         PrepareEnhancedTraceCached(p_App.frame, p_St.signalPrefilter, p_St.smoothTrace,
                                    p_St.lowPassKernel, p_St.traceState, p_St.preparedTrace,
-                                   maskedTrace, p_App.spatialMask, p_App.valueQualifier,
+                                   maskedTrace, p_App.scopeMask, p_App.valueQualifier,
                                    p_St.traceCache);
     if (enhancedReady)
     {
@@ -3472,7 +3661,7 @@ void DrawVectorscopeWheel(App& p_App, VectorscopeState& p_St, PanelCommon& p_Com
                         || built.colorize   != p_St.colorize
                         || built.zoom2x     != p_St.zoom2x
                         || built.masked     != masked
-                        || !SpatialMaskEquals(built.mask, p_App.spatialMask)
+                        || !SpatialMaskEquals(built.mask, p_App.scopeMask)
                         || !ValueQualifierEquals(built.qualifier, p_App.valueQualifier);
         if (stale)
         {
@@ -3487,7 +3676,7 @@ void DrawVectorscopeWheel(App& p_App, VectorscopeState& p_St, PanelCommon& p_Com
             built.colorize   = p_St.colorize;
             built.zoom2x     = p_St.zoom2x;
             built.masked     = masked;
-            built.mask       = p_App.spatialMask;
+            built.mask       = p_App.scopeMask;
             built.qualifier  = p_App.valueQualifier;
         }
 
@@ -3554,6 +3743,21 @@ void DrawVectorscopeWheel(App& p_App, VectorscopeState& p_St, PanelCommon& p_Com
             p_Draw->AddRect(ImVec2(at.x - box, at.y - box), ImVec2(at.x + box, at.y + box),
                             IM_COL32(t.color.r, t.color.g, t.color.b, alpha), 0.0f, 0, 1.0f);
         }
+    }
+
+    // Track Cursor: the probed colour, against the same (2x-aware) range the
+    // trace itself is drawn with - it is a sample, not a reference target. In
+    // the three-band stack, only in the band the probed luma belongs to.
+    if (p_App.cursorProbe.active
+        && (p_BandMask & (1u << VectorscopeBandOf(p_App.cursorProbe.luma))) != 0)
+    {
+        const float* rgb = p_App.cursorProbe.rgb;
+        float cb = 0.0f, cr = 0.0f, u = 0.0f, v = 0.0f;
+        CbCrOfRgb(rgb[0], rgb[1], rgb[2], p_App.frame.lumaCoeff, cb, cr);
+        ChromaToPlot(cb, cr, rangeLo, rangeHi, u, v);
+        if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f)
+            DrawProbeCrosshair(p_Draw, ImVec2(p_Cell.Min.x + u * p_Cell.GetWidth(),
+                                              p_Cell.Min.y + v * p_Cell.GetHeight()));
     }
 
     // The band name, top-left of its own cell. Omitted for All, where there is no
@@ -3785,23 +3989,27 @@ void DrawChromaticityPanel(App& p_App, Panel& p_Panel)
 
     const float brightness = common.graticuleBrightness;
 
-    if (p_App.haveFrame && p_App.frame.HasPreview())
+    // Isolating, the plot is the probe's own mark (drawn below) and nothing
+    // else: the trace would be a handful of near-identical points too close
+    // together to draw a line between, and the density fallback is unmasked -
+    // it would quietly show the whole frame instead.
+    if (p_App.haveFrame && p_App.frame.HasPreview() && !ProbeIsolating(p_App))
     {
         bool drewEnhanced = false;
 
         if (st.enhancedRender && !p_App.prefs.disableEnhancedRender)
         {
             const bool frameChanged     = st.traceFrame != p_App.frame.frameIndex;
-            const bool maskChanged      = !SpatialMaskEquals(st.traceForMask, p_App.spatialMask);
+            const bool maskChanged      = !SpatialMaskEquals(st.traceForMask, p_App.scopeMask);
             const bool qualifierChanged = !ValueQualifierEquals(st.traceForQualifier, p_App.valueQualifier);
 
             if (frameChanged || maskChanged || qualifierChanged)
             {
-                BuildChromaticityTrace(p_App.frame, &p_App.spatialMask, &p_App.valueQualifier, st.trace);
+                BuildChromaticityTrace(p_App.frame, &p_App.scopeMask, &p_App.valueQualifier, st.trace);
                 st.traceHasAnyValid = std::any_of(st.trace.begin(), st.trace.end(),
                                                   [](const ChromaticitySample& s) { return s.valid; });
                 st.traceFrame         = p_App.frame.frameIndex;
-                st.traceForMask       = p_App.spatialMask;
+                st.traceForMask       = p_App.scopeMask;
                 st.traceForQualifier  = p_App.valueQualifier;
             }
 
@@ -3879,6 +4087,16 @@ void DrawChromaticityPanel(App& p_App, Panel& p_Panel)
     {
         const ImVec2 white = pointOf(kGamutTriangles[0].white.x, kGamutTriangles[0].white.y);
         draw->AddCircle(white, 3.0f, GraticuleColor(kColGraticule, brightness), 16, 1.0f);
+    }
+
+    // Track Cursor: the probed colour's (x, y), held to the same too-dark cut
+    // the trace uses - below it the chromaticity is mostly noise.
+    if (p_App.cursorProbe.active && p_App.cursorProbe.luma >= kChromaticityMinLuma)
+    {
+        const float* rgb = p_App.cursorProbe.rgb;
+        float x = 0.0f, y = 0.0f;
+        ChromaticityXyOfRgb(rgb[0], rgb[1], rgb[2], x, y);
+        DrawProbeCrosshair(draw, pointOf(x, y));
     }
 
     if (p_App.haveFrame && !st.analysis.empty)
@@ -4093,6 +4311,16 @@ void DrawLumaVsSatPanel(App& p_App, Panel& p_Panel)
         AddOutlinedText(draw, ImVec2(content.GetCenter().x - size.x * 0.5f, content.GetCenter().y - size.y * 0.5f), msg);
     }
 
+    // Track Cursor: the probed luma, placed by the same bin -> x mapping the
+    // curve above uses, so the line meets the curve at the probe's own bin.
+    if (p_App.cursorProbe.active)
+    {
+        const float level = std::clamp(p_App.frame.LevelOfValue(p_App.cursorProbe.luma),
+                                       0.0f, float(kHistogramBins - 1));
+        DrawProbeLine(draw, content.Min.x + content.GetWidth() * level / float(kHistogramBins - 1),
+                      content.Min.y, content.Max.y);
+    }
+
     // Luma across the bottom, every 10 - plain 0-100, matching the
     // Histogram/old app's own IRE-free convention for this axis.
     for (int level = 0; level <= 100; level += 10)
@@ -4174,14 +4402,14 @@ void DrawHueVsSatPanel(App& p_App, Panel& p_Panel)
     if (p_App.haveFrame && p_App.frame.HasPreview())
     {
         const bool frameChanged     = st.analysisFrame != p_App.frame.frameIndex;
-        const bool maskChanged      = !SpatialMaskEquals(st.analysisForMask, p_App.spatialMask);
+        const bool maskChanged      = !SpatialMaskEquals(st.analysisForMask, p_App.scopeMask);
         const bool qualifierChanged = !ValueQualifierEquals(st.analysisForQualifier, p_App.valueQualifier);
 
         if (frameChanged || maskChanged || qualifierChanged)
         {
-            BuildHueHistogramAnalysis(p_App.frame, &p_App.spatialMask, &p_App.valueQualifier, st.analysis);
+            BuildHueHistogramAnalysis(p_App.frame, &p_App.scopeMask, &p_App.valueQualifier, st.analysis);
             st.analysisFrame        = p_App.frame.frameIndex;
-            st.analysisForMask      = p_App.spatialMask;
+            st.analysisForMask      = p_App.scopeMask;
             st.analysisForQualifier = p_App.valueQualifier;
         }
 
@@ -4236,6 +4464,22 @@ void DrawHueVsSatPanel(App& p_App, Panel& p_Panel)
         const ImVec2 size = ImGui::CalcTextSize(msg);
         draw->AddText(ImVec2(content.GetCenter().x - size.x * 0.5f, content.GetCenter().y - size.y * 0.5f),
                      kTextColor, msg);
+    }
+
+    // Track Cursor: the probed hue, at its own bin - unless the probe is so
+    // close to neutral that BuildHueHistogramAnalysis would not have counted
+    // it at all (the same 0.02 saturation gate), where a hue means nothing.
+    if (p_App.cursorProbe.active)
+    {
+        const float* rgb = p_App.cursorProbe.rgb;
+        float sat = 0.0f, luma = 0.0f, hueDeg = 0.0f;
+        RgbToSatLumaHue(rgb[0], rgb[1], rgb[2], p_App.frame.lumaCoeff, sat, luma, hueDeg);
+        if (sat >= 0.02f)
+        {
+            const int bin = std::clamp(int(hueDeg / 360.0f * float(kHueHistogramBins)), 0, kHueHistogramBins - 1);
+            DrawProbeLine(draw, content.Min.x + content.GetWidth() * float(bin) / float(kHueHistogramBins - 1),
+                          content.Min.y, content.Max.y);
+        }
     }
 
     // Landmark hues across the bottom, same order the vectorscope's own
@@ -5076,6 +5320,45 @@ void DrawSourcePanel(App& p_App, Panel& p_Panel)
         UpdateSpatialMaskInput(p_App, fit, p_Panel.id);
     }
 
+    // Track Cursor: the preview pixel under the pointer, found against the
+    // same zoomed/panned fit the image is drawn into, so it stays the pixel
+    // actually under the pointer at any zoom. Hover only - nothing here reads
+    // a button or the wheel, so zoom and middle-drag pan work as they always
+    // do. Paused while a mask is being drawn or dragged, so the scopes follow
+    // the mask the user is shaping rather than wherever the pointer is. The
+    // fit can run past the panel when zoomed in, hence both rects.
+    ImRect probeRect;
+    bool   probing = false;
+    if (st.trackCursor && haveSource && fit.GetWidth() > 0.0f && fit.GetHeight() > 0.0f)
+    {
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        const bool editingMask = p_App.maskInput.editing != MaskHandle::None || p_App.maskInput.drawingNew;
+        if (!editingMask && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)
+            && avail.Contains(mouse) && fit.Contains(mouse))
+        {
+            const int width  = int(p_App.frame.previewWidth);
+            const int height = int(p_App.frame.previewHeight);
+            const int px = std::clamp(int((mouse.x - fit.Min.x) / fit.GetWidth()  * float(width)),  0, width - 1);
+            const int py = std::clamp(int((mouse.y - fit.Min.y) / fit.GetHeight() * float(height)), 0, height - 1);
+            const int size = std::clamp(st.probeSize, 1, kProbeSizes[IM_ARRAYSIZE(kProbeSizes) - 1]);
+
+            CursorProbeRequest& request = p_App.cursorProbeRequest;
+            request.set   = true;
+            request.style = st.probeStyle;
+            request.mask  = MakePixelProbeMask(px, py, size, width, height);
+
+            int x0, y0, x1, y1;
+            if (PixelProbeBounds(request.mask, width, height, x0, y0, x1, y1))
+            {
+                const float texelW = fit.GetWidth()  / float(width);
+                const float texelH = fit.GetHeight() / float(height);
+                probeRect = ImRect(ImVec2(fit.Min.x + float(x0) * texelW,     fit.Min.y + float(y0) * texelH),
+                                   ImVec2(fit.Min.x + float(x1 + 1) * texelW, fit.Min.y + float(y1 + 1) * texelH));
+                probing = true;
+            }
+        }
+    }
+
     if (haveSource)
     {
         // Rebuilt (or re-uploaded) only when the frame or the tint inputs
@@ -5132,6 +5415,19 @@ void DrawSourcePanel(App& p_App, Panel& p_Panel)
 
     DrawSpatialMaskOverlay(draw, p_App.spatialMask, fit);
     DrawCompositionGrid(draw, fit, st);
+
+    // The probed block itself once zoomed in far enough to see it, and the
+    // same crosshair the scopes carry around it - its hole sized to the
+    // block, so the pixels being measured are never covered.
+    if (probing)
+    {
+        if (probeRect.GetWidth() >= 4.0f)
+        {
+            draw->AddRect(probeRect.Min, probeRect.Max, kColProbeOutline, 0.0f, 0, 3.0f);
+            draw->AddRect(probeRect.Min, probeRect.Max, kColProbe, 0.0f, 0, 1.0f);
+        }
+        DrawProbeCrosshair(draw, probeRect.GetCenter(), probeRect.GetWidth() * 0.5f + 3.0f);
+    }
 
     if (p_App.prefs.showSubtitles && p_App.input == InputSource::Resolve)
         DrawSubtitleOverlay(draw, fit, SubtitleBridgeGetText(p_App.frame.timelineTime), p_App.prefs);
@@ -5530,10 +5826,10 @@ void DrawWhiteBalancePanel(App& p_App, Panel& p_Panel)
     // Enhanced Render replaces the density image rather than overlaying it,
     // same as the Waveform's and Vectorscope's own.
     const bool enhancedReady =
-        st.enhancedRender && !p_App.prefs.disableEnhancedRender &&
+        st.enhancedRender && !p_App.prefs.disableEnhancedRender && !ProbeIsolating(p_App) &&
         PrepareEnhancedTraceCached(p_App.frame, st.signalPrefilter, st.smoothTrace,
                                    st.lowPassKernel, st.traceState, st.preparedTrace,
-                                   maskedTrace, p_App.spatialMask, p_App.valueQualifier,
+                                   maskedTrace, p_App.scopeMask, p_App.valueQualifier,
                                    st.traceCache);
 
     draw->PushClipRect(avail.Min, avail.Max, true);
@@ -5551,7 +5847,7 @@ void DrawWhiteBalancePanel(App& p_App, Panel& p_Panel)
         const bool stale  = st.builtFrameIndex != p_App.frame.frameIndex
                          || st.builtGain   != st.gain
                          || st.builtMasked != masked
-                         || !SpatialMaskEquals(st.builtMask, p_App.spatialMask)
+                         || !SpatialMaskEquals(st.builtMask, p_App.scopeMask)
                          || !ValueQualifierEquals(st.builtQualifier, p_App.valueQualifier);
         if (stale)
         {
@@ -5562,7 +5858,7 @@ void DrawWhiteBalancePanel(App& p_App, Panel& p_Panel)
             st.builtFrameIndex = p_App.frame.frameIndex;
             st.builtGain       = st.gain;
             st.builtMasked     = masked;
-            st.builtMask       = p_App.spatialMask;
+            st.builtMask       = p_App.scopeMask;
             st.builtQualifier  = p_App.valueQualifier;
         }
 
@@ -5574,6 +5870,24 @@ void DrawWhiteBalancePanel(App& p_App, Panel& p_Panel)
 
     DrawWhiteBalanceDiamond(draw, fit, p_App.frame, true,  common.graticuleBrightness);
     DrawWhiteBalanceDiamond(draw, fit, p_App.frame, false, common.graticuleBrightness);
+
+    // Track Cursor: the probed pixel in both diamonds - G against B above, G
+    // against R below - mapped the way DrawWhiteBalanceEnhanced maps a sample.
+    if (p_App.cursorProbe.active)
+    {
+        const float* rgb = p_App.cursorProbe.rgb;
+        for (int d = 0; d < 2; ++d)
+        {
+            const bool  upper = (d == 0);
+            const float other = upper ? rgb[2] : rgb[0];
+            float u = 0.0f, v = 0.0f;
+            TwinPeaksToPlot((rgb[1] + other) * 0.5f, (rgb[1] - other) * 0.5f,
+                            p_App.frame.binRangeLow, p_App.frame.binRangeHigh, upper, u, v);
+            if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f)
+                DrawProbeCrosshair(draw, ImVec2(fit.Min.x + u * fit.GetWidth(),
+                                                fit.Min.y + v * fit.GetHeight()));
+        }
+    }
 
     if (p_App.maskedScopeValid && p_App.maskedScope.empty)
         DrawMaskEmptyNotice(draw, fit);
@@ -6929,14 +7243,14 @@ void DrawColorCubePanel(App& p_App, Panel& p_Panel)
     // the same set for both drawing and (eventually) picking, not a fresh
     // sample per draw call.
     if (st.pointsFrameIndex != p_App.frame.frameIndex || st.pointsSpace != st.space
-        || !SpatialMaskEquals(st.pointsMask, p_App.spatialMask)
+        || !SpatialMaskEquals(st.pointsMask, p_App.scopeMask)
         || !ValueQualifierEquals(st.pointsQualifier, p_App.valueQualifier))
     {
         BuildColorCubePoints(p_App.frame, st.space, st.points,
-                             &p_App.spatialMask, &p_App.valueQualifier);
+                             &p_App.scopeMask, &p_App.valueQualifier);
         st.pointsFrameIndex = p_App.frame.frameIndex;
         st.pointsSpace      = st.space;
-        st.pointsMask       = p_App.spatialMask;
+        st.pointsMask       = p_App.scopeMask;
         st.pointsQualifier  = p_App.valueQualifier;
     }
 
@@ -7077,6 +7391,28 @@ void DrawColorCubePanel(App& p_App, Panel& p_Panel)
         ImVec2 pos; float unusedDepth;
         project(sx, sy, sz, pos, unusedDepth);
         draw->AddCircleFilled(pos, pointRadius, IM_COL32(pt.colour.r, pt.colour.g, pt.colour.b, 255));
+    }
+
+    // Track Cursor: the probed colour, positioned and Spread exactly as a
+    // cloud point of that colour would be, and drawn over the whole cloud
+    // rather than depth-sorted into it - a mark the cloud can hide is no mark.
+    if (p_App.cursorProbe.active)
+    {
+        const float* rgb = p_App.cursorProbe.rgb;
+        float px = 0.0f, py = 0.0f, pz = 0.0f;
+        ColorCubePositionOf(rgb[0], rgb[1], rgb[2], st.space, px, py, pz);
+
+        const float dx = px - neutral[0][0], dy = py - neutral[0][1], dz = pz - neutral[0][2];
+        const float t  = (dx * axisX + dy * axisY + dz * axisZ) / axisLenSq;
+        const float onAxisX = neutral[0][0] + t * axisX;
+        const float onAxisY = neutral[0][1] + t * axisY;
+        const float onAxisZ = neutral[0][2] + t * axisZ;
+        const float spread  = float(st.spread);
+
+        ImVec2 pos; float unusedDepth;
+        project(onAxisX + (px - onAxisX) * spread, onAxisY + (py - onAxisY) * spread,
+                onAxisZ + (pz - onAxisZ) * spread, pos, unusedDepth);
+        DrawProbeCrosshair(draw, pos, pointRadius + 2.0f);
     }
 
     // Neutral axis, dashed, with endpoint labels - drawn after the points so
@@ -8029,6 +8365,41 @@ void DrawSourceSettings(App& p_App, Panel& p_Panel)
 
     ImGui::Separator();
 
+    SettingsRowLabel("Track Cursor");
+    ImGui::Checkbox("##trackcursor", &st.trackCursor);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("While the pointer is over the image, the scopes show the\n"
+                          "pixel(s) under it. Wheel zoom and middle-drag pan work as\n"
+                          "usual. Also on this panel's right-click menu.");
+
+    if (st.trackCursor)
+    {
+        SettingsRowLabel("Probe Style");
+        const char* styleNames[] = { "Crosshair", "Isolate" };
+        int styleIndex = std::clamp(int(st.probeStyle), 0, int(CursorProbeStyle::Count) - 1);
+        if (ImGui::Combo("##probestyle", &styleIndex, styleNames, IM_ARRAYSIZE(styleNames)))
+            st.probeStyle = CursorProbeStyle(styleIndex);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Crosshair: every scope keeps showing the whole frame, with\n"
+                              "a marker where the probed value sits.\n"
+                              "Isolate: the scopes show only the probed pixel(s), the way\n"
+                              "a drawn mask restricts them.");
+
+        SettingsRowLabel("Probe Size");
+        const char* sizeNames[] = { "1 x 1", "3 x 3", "5 x 5", "9 x 9", "15 x 15" };
+        static_assert(IM_ARRAYSIZE(sizeNames) == IM_ARRAYSIZE(kProbeSizes), "one name per probe size");
+        int sizeIndex = 0;
+        for (int i = 0; i < IM_ARRAYSIZE(kProbeSizes); ++i)
+            if (kProbeSizes[i] == st.probeSize) sizeIndex = i;
+        if (ImGui::Combo("##probesize", &sizeIndex, sizeNames, IM_ARRAYSIZE(sizeNames)))
+            st.probeSize = kProbeSizes[sizeIndex];
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Preview pixels measured around the pointer. Crosshair\n"
+                              "marks their average; Isolate shows each of them.");
+    }
+
+    ImGui::Separator();
+
     SpatialMask& mask = p_App.spatialMask;
     SettingsRowLabel("Mask Shape");
     const char* shapeNames[] = { "Ellipse", "Rectangle", "Gradient" };
@@ -8483,6 +8854,11 @@ void DrawPanelMenu(App& p_App, Panel& p_Panel)
         p_Panel.common.showSettings        = true;
         p_Panel.common.settingsPlaceFrames = 2;
     }
+
+    // Here as well as in Settings: it is toggled on and off while grading,
+    // far more often than any other Source setting.
+    if (p_Panel.kind == PanelKind::Source)
+        ImGui::MenuItem("Track Cursor", nullptr, &p_Panel.source.trackCursor);
 
     ImGui::Separator();
 
@@ -8994,6 +9370,7 @@ void DrawFrame(App& p_App)
     ImGui::End();
 
     RebuildValueQualifier(p_App);
+    ResolveCursorProbe(p_App);
     EnsureMaskedScopeBins(p_App);
 
     // Solo is implemented by simply not submitting the other panels. ImGui hands a

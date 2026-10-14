@@ -41,6 +41,47 @@ run. `-ffp-contract=off` is now set for the whole tree on every non-MSVC
 compiler (CMakeLists.txt), so the Mac CPU path, the Windows CPU path and the
 reference agree bit-for-bit.
 
+## Added: Track Cursor on the Source panel (not an old-app feature)
+
+Hovering the Source image shows the preview pixel(s) under the pointer on
+the scopes - Resolve's viewer-picker behaviour, asked for by a user who could
+never get Resolve's to turn on reliably. One checkbox: on the panel's
+right-click menu and in its Settings, with Probe Style and Probe Size
+(1x1 to 15x15 preview pixels) beside it in Settings; all three are saved per
+panel. Hover only, so wheel zoom and middle-drag pan behave as before, and the
+probed pixel stays the one under the pointer at any zoom. Paused while a mask
+is being drawn or dragged.
+
+- **Crosshair** (default): every scope keeps reading the whole frame (or the
+  drawn mask) and carries a cyan mark (`kColProbe`) where the probe's mean
+  value sits - Waveform (each plane, at the pixel's own column), Histogram
+  (a line per channel), Vectorscope (in the probe's own band in the stack),
+  White Balance (both diamonds), CIE, Luma vs Sat, Hue vs Sat (unless near
+  neutral), Color Cube. Each is mapped through the same function that scope
+  maps its own trace samples with.
+- **Isolate**: the scopes measure only the probed block, through the masked-
+  scope path a drawn mask uses. The probe is a `MaskShape::Pixels`
+  `SpatialMask` the user never draws; `App::scopeMask` is that or
+  `spatialMask`, settled once per frame by `ResolveCursorProbe` before
+  `EnsureMaskedScopeBins`, and every measuring scope now reads it - the
+  preview-tier panels (Source, False Color, Skin Tone) keep `spatialMask`.
+  The builders that subsample (Color Cube points, Hue histogram) sample the
+  block whole instead of striding over it, and the re-bin visits only the
+  block. A block that small has no line to draw, so Enhanced Render steps
+  aside for the binned picture while isolating and the masked trace is not
+  built; CIE shows just the mark (its density fallback is unmasked).
+
+The probe is one frame behind the pointer: a Source panel learns where the
+pointer is only as it draws, so it files a request that the next frame
+resolves before any scope reads it, keeping every scope in a frame on the
+same probe. A side effect of snapshotting `scopeMask` with the masked bins:
+a scope's cached picture can no longer be keyed to a mask edit the bins have
+not caught up with yet, which could leave a held frame one drag step stale.
+Checked by a throwaway harness (probe bounds at image edges, the inside test
+against the builders' own pixel positions, Isolate's bins identical to a
+plain rectangle over the same pixels, cube/hue totals); not yet tried live
+against Resolve.
+
 ## Fixed: Colorize made Enhanced Render ~4x more expensive, and it was none of
 ## the things it looked like
 

@@ -52,6 +52,13 @@ constexpr ImU32 kColHistogramScale = kColGratLabel;
 // reference direction, not a measurement, and must not compete with the trace.
 constexpr ImU32 kColSkinTone = IM_COL32(214, 176, 150, 210);
 
+// The Source panel's Track Cursor probe, marked on the image and on every scope.
+// Cyan rather than another warm tone: it has to separate from the amber
+// graticule, the yellow cursor readout and white, red, green or blue traces
+// alike. Always drawn over a dark outline so it also reads on a bright trace.
+constexpr ImU32 kColProbe        = IM_COL32( 70, 225, 255, 255);
+constexpr ImU32 kColProbeOutline = IM_COL32(  0,   0,   0, 200);
+
 // Status, used for the reader states in the footer.
 constexpr ImU32 kColLive         = IM_COL32( 92, 200, 128, 255);
 constexpr ImU32 kColWaiting      = IM_COL32(190, 170,  90, 255);

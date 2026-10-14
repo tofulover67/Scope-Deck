@@ -527,9 +527,51 @@ DiamondGraticule WhiteBalanceGraticule(const ScopeFrame& p_Frame, bool p_UpperDi
 }
 
 
+SpatialMask MakePixelProbeMask(int p_Px, int p_Py, int p_Size, int p_Width, int p_Height)
+{
+    const int half = std::max(p_Size, 1) / 2;
+    const int px0 = std::clamp(p_Px - half, 0, std::max(p_Width - 1, 0));
+    const int px1 = std::clamp(p_Px + half, 0, std::max(p_Width - 1, 0));
+    const int py0 = std::clamp(p_Py - half, 0, std::max(p_Height - 1, 0));
+    const int py1 = std::clamp(p_Py + half, 0, std::max(p_Height - 1, 0));
+    const float denomX = float(std::max(p_Width - 1, 1));
+    const float denomY = float(std::max(p_Height - 1, 1));
+
+    SpatialMask mask;
+    mask.hasGeometry = true;
+    mask.shape = MaskShape::Pixels;
+    mask.x0 = (float(px0) - 0.5f) / denomX;
+    mask.x1 = (float(px1) + 0.5f) / denomX;
+    mask.y0 = (float(py0) - 0.5f) / denomY;
+    mask.y1 = (float(py1) + 0.5f) / denomY;
+    return mask;
+}
+
+bool PixelProbeBounds(const SpatialMask& p_Mask, int p_Width, int p_Height,
+                      int& p_OutX0, int& p_OutY0, int& p_OutX1, int& p_OutY1)
+{
+    if (!p_Mask.hasGeometry || p_Mask.shape != MaskShape::Pixels || p_Width <= 0 || p_Height <= 0)
+        return false;
+
+    const float denomX = float(std::max(p_Width - 1, 1));
+    const float denomY = float(std::max(p_Height - 1, 1));
+    p_OutX0 = std::clamp(int(std::ceil(p_Mask.x0 * denomX)),  0, p_Width - 1);
+    p_OutX1 = std::clamp(int(std::floor(p_Mask.x1 * denomX)), 0, p_Width - 1);
+    p_OutY0 = std::clamp(int(std::ceil(p_Mask.y0 * denomY)),  0, p_Height - 1);
+    p_OutY1 = std::clamp(int(std::floor(p_Mask.y1 * denomY)), 0, p_Height - 1);
+    return p_OutX0 <= p_OutX1 && p_OutY0 <= p_OutY1;
+}
+
 float SpatialMaskWeightAt(const SpatialMask& p_Mask, float p_Fx, float p_Fy, float p_Aspect)
 {
     if (!p_Mask.hasGeometry) return 1.0f;
+
+    // Axis-aligned in pixel space, so no aspect correction and no rotation.
+    if (p_Mask.shape == MaskShape::Pixels)
+    {
+        const bool inside = p_Fx >= p_Mask.x0 && p_Fx <= p_Mask.x1 && p_Fy >= p_Mask.y0 && p_Fy <= p_Mask.y1;
+        return (inside != p_Mask.invert) ? 1.0f : 0.0f;
+    }
 
     float weight;
     if (p_Mask.shape == MaskShape::Gradient)
@@ -1244,10 +1286,24 @@ void BuildScopeBinsFromRGB(const uint8_t* p_Rgb, int p_Width, int p_Height,
     const SpatialMask maskCopy = hasMask ? *p_Mask : SpatialMask{};
     const bool  hasQualifier = p_Qualifier != nullptr && p_Qualifier->AnyActive();
 
+    // A cursor probe keeps only its own small block, so only that block is
+    // visited - the same counts a full-frame pass would give, without testing
+    // every pixel of the frame on every mouse move. One thread is plenty for
+    // a block that size.
+    int rowBegin = 0, rowEnd = height, colBegin = 0, colEnd = width;
+    int probeX0 = 0, probeY0 = 0, probeX1 = 0, probeY1 = 0;
+    const bool probe = hasMask && PixelProbeBounds(maskCopy, width, height, probeX0, probeY0, probeX1, probeY1);
+    if (probe)
+    {
+        rowBegin = probeY0; rowEnd = probeY1 + 1;
+        colBegin = probeX0; colEnd = probeX1 + 1;
+    }
+
     // Private bins per thread, merged afterwards - same reasoning as
     // ScopeCore.cpp's Reduce(): contended atomics across every preview pixel
     // would cost more than the merge below does.
-    const int numThreads = std::max(1, std::min(int(std::thread::hardware_concurrency()), height));
+    const int numThreads = probe ? 1
+        : std::max(1, std::min(int(std::thread::hardware_concurrency()), height));
 
     std::vector<std::vector<uint32_t>> partialWave(numThreads);
     std::vector<std::vector<uint32_t>> partialVec(numThreads);
@@ -1261,13 +1317,13 @@ void BuildScopeBinsFromRGB(const uint8_t* p_Rgb, int p_Width, int p_Height,
         partialTp[t].assign(size_t(kTwinPeaksTotalCells), 0u);
     }
 
-    const int rowsPerThread = height / numThreads;
+    const int rowsPerThread = (rowEnd - rowBegin) / numThreads;
     std::vector<std::future<void>> futures;
 
     for (int t = 0; t < numThreads; ++t)
     {
-        const int startY = t * rowsPerThread;
-        const int endY = (t == numThreads - 1) ? height : startY + rowsPerThread;
+        const int startY = rowBegin + t * rowsPerThread;
+        const int endY = (t == numThreads - 1) ? rowEnd : startY + rowsPerThread;
 
         futures.push_back(std::async(std::launch::async, [&, t, startY, endY]()
         {
@@ -1281,7 +1337,7 @@ void BuildScopeBinsFromRGB(const uint8_t* p_Rgb, int p_Width, int p_Height,
                 const float fy = float(y) / float(std::max(height - 1, 1));
                 const uint8_t* row = inPx + size_t(y) * size_t(width) * 3;
 
-                for (int x = 0; x < width; ++x)
+                for (int x = colBegin; x < colEnd; ++x)
                 {
                     const float fx = float(x) / float(std::max(width - 1, 1));
 
@@ -1383,7 +1439,16 @@ void BuildMaskedScopeBins(const ScopeFrame& p_Frame, const SpatialMask& p_Mask, 
     const SpatialMask* maskArg = p_Mask.hasGeometry ? &p_Mask : nullptr;
     BuildScopeBinsFromRGB(p_Frame.preview.data(), int(p_Frame.previewWidth), int(p_Frame.previewHeight),
                          p_Frame.lumaCoeff, maskArg, p_Out, p_Qualifier);
-    BuildMaskedWaveformTrace(p_Frame, p_Mask, p_Out.waveformTrace, p_Qualifier);
+
+    // No trace for a cursor probe: a block that small lands in one or two
+    // trace columns, which no line trace can draw (a run needs two points),
+    // so every Enhanced Render view falls back to its binned picture while
+    // probing instead - see App::cursorProbeActive. Skipping it also skips
+    // the masked path's single most expensive pass on every mouse move.
+    if (p_Mask.hasGeometry && p_Mask.shape == MaskShape::Pixels)
+        p_Out.waveformTrace.clear();
+    else
+        BuildMaskedWaveformTrace(p_Frame, p_Mask, p_Out.waveformTrace, p_Qualifier);
 }
 
 void BuildMaskedWaveformTrace(const ScopeFrame& p_Frame, const SpatialMask& p_Mask, std::vector<float>& p_Out,
@@ -1678,6 +1743,47 @@ void XyzToLab(float p_X, float p_Y, float p_Z, float& p_L, float& p_A, float& p_
     p_B = 200.0f * (fy - fz);
 }
 
+void ColorCubePositionOf(float p_R, float p_G, float p_B, ColorCubeSpace p_Space,
+                         float& p_OutX, float& p_OutY, float& p_OutZ)
+{
+    p_OutX = p_OutY = p_OutZ = 0.0f;
+    switch (p_Space)
+    {
+        case ColorCubeSpace::RGB:
+            p_OutX = p_R * 2.0f - 1.0f;
+            p_OutY = p_G * 2.0f - 1.0f;
+            p_OutZ = p_B * 2.0f - 1.0f;
+            break;
+
+        case ColorCubeSpace::XYZ:
+        {
+            float x, y, z;
+            SrgbToXyz(p_R, p_G, p_B, x, y, z);
+            // D65 white bounds (x: 0..0.95047, y: 0..1, z: 0..1.08883),
+            // the same per-axis ranges the old app's
+            // COLOR_CUBE_AXIS_RANGES used, so RGB/XYZ/Lab all share one
+            // camera scale.
+            p_OutX = (x / 0.95047f) * 2.0f - 1.0f;
+            p_OutY = y * 2.0f - 1.0f;
+            p_OutZ = (z / 1.08883f) * 2.0f - 1.0f;
+            break;
+        }
+
+        case ColorCubeSpace::Lab:
+        {
+            float x, y, z, L, a, bLab;
+            SrgbToXyz(p_R, p_G, p_B, x, y, z);
+            XyzToLab(x, y, z, L, a, bLab);
+            p_OutX = (L / 100.0f) * 2.0f - 1.0f;                       // L: 0..100
+            p_OutY = std::clamp(a / 128.0f, -1.0f, 1.0f);              // a*: ~-128..127
+            p_OutZ = std::clamp(bLab / 128.0f, -1.0f, 1.0f);           // b*: ~-128..127
+            break;
+        }
+
+        default: break;
+    }
+}
+
 void BuildColorCubePoints(const ScopeFrame& p_Frame, ColorCubeSpace p_Space,
                           std::vector<ColorCubePoint>& p_Out,
                           const SpatialMask* p_Mask, const ValueQualifier* p_Qualifier)
@@ -1711,9 +1817,19 @@ void BuildColorCubePoints(const ScopeFrame& p_Frame, ColorCubeSpace p_Space,
     const int   height       = int(p_Frame.previewHeight);
     const float aspect       = float(width) / float(std::max(height, 1));
 
-    for (int i = 0; i < sampleCount; ++i)
+    // A cursor probe's block is far smaller than the stride, so the strided
+    // walk would usually step over it and leave the cloud empty. Every pixel
+    // of the block instead - a few hundred at most.
+    int probeX0 = 0, probeY0 = 0, probeX1 = 0, probeY1 = 0;
+    const bool probe = hasMask && PixelProbeBounds(*p_Mask, width, height, probeX0, probeY0, probeX1, probeY1);
+    const int  probeWidth = probe ? probeX1 - probeX0 + 1 : 0;
+    const int  loopCount  = probe ? probeWidth * (probeY1 - probeY0 + 1) : sampleCount;
+
+    for (int i = 0; i < loopCount; ++i)
     {
-        const uint64_t idx = (offset + uint64_t(i) * stride) % totalPixels;
+        const uint64_t idx = probe
+            ? uint64_t(probeY0 + i / probeWidth) * uint64_t(width) + uint64_t(probeX0 + i % probeWidth)
+            : (offset + uint64_t(i) * stride) % totalPixels;
         const uint8_t* p = px + idx * 3;
         const float r = p[0] / 255.0f, g = p[1] / 255.0f, b = p[2] / 255.0f;
 
@@ -1732,43 +1848,7 @@ void BuildColorCubePoints(const ScopeFrame& p_Frame, ColorCubeSpace p_Space,
 
         ColorCubePoint pt;
         pt.colour = { p[0], p[1], p[2] };
-
-        switch (p_Space)
-        {
-            case ColorCubeSpace::RGB:
-                pt.x = r * 2.0f - 1.0f;
-                pt.y = g * 2.0f - 1.0f;
-                pt.z = b * 2.0f - 1.0f;
-                break;
-
-            case ColorCubeSpace::XYZ:
-            {
-                float x, y, z;
-                SrgbToXyz(r, g, b, x, y, z);
-                // D65 white bounds (x: 0..0.95047, y: 0..1, z: 0..1.08883),
-                // the same per-axis ranges the old app's
-                // COLOR_CUBE_AXIS_RANGES used, so RGB/XYZ/Lab all share one
-                // camera scale.
-                pt.x = (x / 0.95047f) * 2.0f - 1.0f;
-                pt.y = y * 2.0f - 1.0f;
-                pt.z = (z / 1.08883f) * 2.0f - 1.0f;
-                break;
-            }
-
-            case ColorCubeSpace::Lab:
-            {
-                float x, y, z, L, a, bLab;
-                SrgbToXyz(r, g, b, x, y, z);
-                XyzToLab(x, y, z, L, a, bLab);
-                pt.x = (L / 100.0f) * 2.0f - 1.0f;                       // L: 0..100
-                pt.y = std::clamp(a / 128.0f, -1.0f, 1.0f);              // a*: ~-128..127
-                pt.z = std::clamp(bLab / 128.0f, -1.0f, 1.0f);           // b*: ~-128..127
-                break;
-            }
-
-            default: break;
-        }
-
+        ColorCubePositionOf(r, g, b, p_Space, pt.x, pt.y, pt.z);
         p_Out.push_back(pt);
     }
 }
@@ -2146,8 +2226,20 @@ void BuildHueHistogramAnalysis(const ScopeFrame& p_Frame, const SpatialMask* p_M
 
     const uint64_t total = uint64_t(width) * uint64_t(height);
     constexpr uint64_t kBudget = 200000;
-    const int stride = (total <= kBudget) ? 1
+    int stride = (total <= kBudget) ? 1
         : std::max(1, int(std::ceil(std::sqrt(double(total) / double(kBudget)))));
+
+    // A cursor probe's block, every pixel of it - the stride above would
+    // step over most of a block that small. Same reasoning as
+    // BuildColorCubePoints.
+    int rowBegin = 0, rowEnd = height, colBegin = 0, colEnd = width;
+    int probeX0 = 0, probeY0 = 0, probeX1 = 0, probeY1 = 0;
+    if (p_Mask && PixelProbeBounds(*p_Mask, width, height, probeX0, probeY0, probeX1, probeY1))
+    {
+        rowBegin = probeY0; rowEnd = probeY1 + 1;
+        colBegin = probeX0; colEnd = probeX1 + 1;
+        stride = 1;
+    }
 
     const uint8_t* px = p_Frame.preview.data();
     const float* lumaCoeff = p_Frame.lumaCoeff;
@@ -2157,12 +2249,12 @@ void BuildHueHistogramAnalysis(const ScopeFrame& p_Frame, const SpatialMask* p_M
     constexpr float kMinSat = 0.02f;
 
     bool any = false;
-    for (int y = 0; y < height; y += stride)
+    for (int y = rowBegin; y < rowEnd; y += stride)
     {
         const float fy = float(y) / float(std::max(height - 1, 1));
         const uint8_t* row = px + size_t(y) * size_t(width) * 3;
 
-        for (int x = 0; x < width; x += stride)
+        for (int x = colBegin; x < colEnd; x += stride)
         {
             const float fx = float(x) / float(std::max(width - 1, 1));
             if (hasMask && SpatialMaskWeightAt(*p_Mask, fx, fy, aspect) < 0.5f) continue;
